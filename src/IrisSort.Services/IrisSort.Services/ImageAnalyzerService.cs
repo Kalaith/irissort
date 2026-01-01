@@ -1,7 +1,9 @@
 using System.Collections.Concurrent;
 using IrisSort.Core.Models;
 using IrisSort.Services.Configuration;
+using IrisSort.Services.Configuration;
 using IrisSort.Services.Exceptions;
+using SkiaSharp;
 
 namespace IrisSort.Services;
 
@@ -12,6 +14,7 @@ public class ImageAnalyzerService : IDisposable
 {
     private readonly LmStudioVisionService _visionService;
     private readonly FolderScannerService _folderScanner;
+    private readonly ImageResizerService _imageResizer;
     private readonly bool _ownsVisionService;
     private readonly ConcurrentDictionary<string, ImageAnalysisResult> _cache = new();
     private bool _disposed;
@@ -20,6 +23,7 @@ public class ImageAnalyzerService : IDisposable
     {
         _visionService = visionService ?? throw new ArgumentNullException(nameof(visionService));
         _folderScanner = folderScanner ?? new FolderScannerService();
+        _imageResizer = new ImageResizerService();
         _ownsVisionService = ownsVisionService;
     }
 
@@ -63,31 +67,86 @@ public class ImageAnalyzerService : IDisposable
                 return cached;
             }
 
-            // Read image data
-            var imageData = await File.ReadAllBytesAsync(filePath, cancellationToken);
-            var mimeType = FolderScannerService.GetMimeType(filePath);
+            // Check if image needs resizing due to size limits OR if it's WebP (needs conversion)
+            string? tempResizedPath = null;
+            byte[] imageData;
+            string mimeType;
 
-            // Call vision API with original filename for context
-            var apiResponse = await _visionService.AnalyzeWithRetryAsync(
-                imageData, mimeType, result.OriginalFilename, cancellationToken);
+            try
+            {
+                var isWebP = fileInfo.Extension.Equals(".webp", StringComparison.OrdinalIgnoreCase);
 
-            // Copy all metadata from API response
-            result.SuggestedFilename = apiResponse.SuggestedFilename;
-            result.Tags = apiResponse.Tags;
-            result.Description = apiResponse.Description;
-            result.Title = apiResponse.Title;
-            result.Subject = apiResponse.Subject;
-            result.Comments = apiResponse.Comments;
-            result.Authors = apiResponse.Authors;
-            result.Copyright = apiResponse.Copyright;
-            result.VisibleDate = apiResponse.VisibleDate;
-            result.Status = AnalysisStatus.Success;
-            result.AnalyzedAt = DateTime.Now;
+                var maxDimension = _visionService.Configuration.MaxImageDimension;
+                bool needsResizing = false;
 
-            // Cache result (thread-safe)
-            _cache.AddOrUpdate(result.FileHash, result, (key, old) => result);
+                // Check file size first (fast)
+                if (_imageResizer.NeedsResizing(fileInfo.Length))
+                {
+                    needsResizing = true;
+                }
+                else
+                {
+                    // Check dimensions (slower, requires reading header)
+                    using var stream = File.OpenRead(filePath);
+                    using var codec = SKCodec.Create(stream);
+                    if (codec != null)
+                    {
+                        if (codec.Info.Width > maxDimension || codec.Info.Height > maxDimension)
+                        {
+                            needsResizing = true;
+                        }
+                    }
+                }
 
-            return result;
+                if (needsResizing || isWebP)
+                {
+                    // Create resized/converted copy for analysis
+                    // ImageResizerService automatically converts WebP to JPEG
+                    tempResizedPath = await _imageResizer.CreateResizedCopyAsync(filePath, maxDimension, cancellationToken);
+                    imageData = await File.ReadAllBytesAsync(tempResizedPath, cancellationToken);
+                    mimeType = FolderScannerService.GetMimeType(tempResizedPath); // Will be image/jpeg for converted WebP
+                }
+                else
+                {
+                    imageData = await File.ReadAllBytesAsync(filePath, cancellationToken);
+                    mimeType = FolderScannerService.GetMimeType(filePath);
+                }
+
+                // Call vision API with original filename for context
+                var apiResponse = await _visionService.AnalyzeWithRetryAsync(
+                    imageData, mimeType, result.OriginalFilename, cancellationToken);
+
+                // Copy all metadata from API response
+                result.SuggestedFilename = apiResponse.SuggestedFilename;
+                result.Tags = apiResponse.Tags;
+                result.Description = apiResponse.Description;
+                result.Title = apiResponse.Title;
+                result.Subject = apiResponse.Subject;
+                result.Comments = apiResponse.Comments;
+                result.Authors = apiResponse.Authors;
+                result.Copyright = apiResponse.Copyright;
+                result.VisibleDate = apiResponse.VisibleDate;
+                result.Status = AnalysisStatus.Success;
+                result.AnalyzedAt = DateTime.Now;
+
+                // Cache result (thread-safe)
+                _cache.AddOrUpdate(result.FileHash, result, (key, old) => result);
+
+                return result;
+            }
+            finally
+            {
+                // Clean up temporary resized file if created
+                if (tempResizedPath != null)
+                {
+                    _imageResizer.DeleteTemporaryFile(tempResizedPath);
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Re-throw cancellation to allow batch processing to handle it properly
+            throw;
         }
         catch (LmStudioApiException ex)
         {
@@ -105,6 +164,7 @@ public class ImageAnalyzerService : IDisposable
 
     /// <summary>
     /// Analyzes multiple images with progress reporting.
+    /// Returns partial results if cancelled or if individual images fail.
     /// </summary>
     public async Task<List<ImageAnalysisResult>> AnalyzeBatchAsync(
         IEnumerable<string> filePaths,
@@ -117,15 +177,41 @@ public class ImageAnalyzerService : IDisposable
 
         for (int i = 0; i < total; i++)
         {
-            cancellationToken.ThrowIfCancellationRequested();
+            // Check for cancellation but don't throw - return partial results instead
+            if (cancellationToken.IsCancellationRequested)
+            {
+                break;
+            }
 
             var filePath = files[i];
             var fileName = Path.GetFileName(filePath);
 
             progress?.Report((i + 1, total, fileName));
 
-            var result = await AnalyzeImageAsync(filePath, cancellationToken);
-            results.Add(result);
+            try
+            {
+                var result = await AnalyzeImageAsync(filePath, cancellationToken);
+                results.Add(result);
+            }
+            catch (OperationCanceledException)
+            {
+                // Cancellation occurred mid-analysis - break loop and return partial results
+                break;
+            }
+            catch (Exception ex)
+            {
+                // If individual image fails catastrophically, create error result and continue
+                var fileInfo = new FileInfo(filePath);
+                results.Add(new ImageAnalysisResult
+                {
+                    OriginalPath = filePath,
+                    OriginalFilename = fileInfo.Name,
+                    Extension = fileInfo.Extension.ToLowerInvariant(),
+                    FileSizeBytes = fileInfo.Length,
+                    Status = AnalysisStatus.Failed,
+                    ErrorMessage = $"Analysis failed: {ex.Message}"
+                });
+            }
         }
 
         return results;
@@ -169,9 +255,13 @@ public class ImageAnalyzerService : IDisposable
         if (_disposed)
             return;
 
-        if (disposing && _ownsVisionService)
+        if (disposing)
         {
-            _visionService?.Dispose();
+            _imageResizer?.Dispose();
+            if (_ownsVisionService)
+            {
+                _visionService?.Dispose();
+            }
         }
 
         _disposed = true;

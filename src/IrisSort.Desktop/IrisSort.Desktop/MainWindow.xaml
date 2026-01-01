@@ -34,12 +34,34 @@
                     </StackPanel>
                 </StackPanel>
                 
-                <!-- Connection Status -->
+                <!-- Connection Status and Model Selection -->
                 <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center">
-                    <Ellipse x:Name="ConnectionIndicator" Width="10" Height="10" 
+                    <Ellipse x:Name="ConnectionIndicator" Width="10" Height="10"
                              Fill="{StaticResource ErrorBrush}" Margin="0,0,8,0"/>
-                    <TextBlock x:Name="ConnectionStatus" Text="LM Studio: Checking..." 
+                    <TextBlock x:Name="ConnectionStatus" Text="LM Studio: Checking..."
                                FontSize="13" Foreground="{StaticResource TextSecondaryBrush}"/>
+                    <TextBlock Text=" | Model:" FontSize="13" Foreground="{StaticResource TextSecondaryBrush}" Margin="12,0,4,0"/>
+                    <ComboBox x:Name="ModelComboBox"
+                              Width="200"
+                              FontSize="12"
+                              SelectionChanged="ModelComboBox_SelectionChanged"
+                              ToolTip="Select vision model from LM Studio"/>
+                    <Button x:Name="RefreshModelsButton"
+                            Content="🔄"
+                            Style="{StaticResource SecondaryButton}"
+                            Margin="4,0,0,0"
+                            Padding="8,4"
+                            Click="RefreshModelsButton_Click"
+                            ToolTip="Refresh model list"/>
+                    
+                    <TextBlock Text=" | Max Dim:" FontSize="13" Foreground="{StaticResource TextSecondaryBrush}" Margin="12,0,4,0"/>
+                    <TextBox x:Name="MaxDimTextBox"
+                             Width="60"
+                             Padding="4,2"
+                             VerticalAlignment="Center"
+                             LostFocus="MaxDimTextBox_LostFocus"
+                             KeyDown="MaxDimTextBox_KeyDown"
+                             ToolTip="Maximum image dimension (pixels). Images larger than this will be resized."/>
                 </StackPanel>
             </Grid>
         </Border>

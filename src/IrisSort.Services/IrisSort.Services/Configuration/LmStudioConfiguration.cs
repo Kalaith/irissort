@@ -16,6 +16,12 @@ public class LmStudioConfiguration
     public string Model { get; set; } = "zai-org/glm-4.6v-flash";
 
     /// <summary>
+    /// Maximum dimension for images (width or height).
+    /// Images larger than this will be resized.
+    /// </summary>
+    public int MaxImageDimension { get; set; } = 1024;
+
+    /// <summary>
     /// Maximum number of retry attempts for failed requests.
     /// </summary>
     public int MaxRetries { get; set; } = 3;

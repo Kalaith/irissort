@@ -186,21 +186,48 @@ public class PngWebpMetadataWriter
             bool xmpInserted = false;
 
             // Parse PNG chunks
-            while (position < fileData.Length - 12)
+            while (position < fileData.Length) // Changed condition to handle inside loop
             {
+                // We need at least 12 bytes for a chunk (Length 4 + Type 4 + CRC 4, Data 0)
+                if (position + 12 > fileData.Length)
+                {
+                    _logger.Warning("Unexpected end of file while reading chunk header at position {Position}", position);
+                    break;
+                }
+
                 // Read chunk length (4 bytes, big-endian)
-                int chunkLength = (fileData[position] << 24) | (fileData[position + 1] << 16) |
-                                  (fileData[position + 2] << 8) | fileData[position + 3];
+                // Use uint to prevent negative numbers if high bit is set (though standard PNG chunks are < 2^31)
+                uint chunkLengthUni = ((uint)fileData[position] << 24) | 
+                                      ((uint)fileData[position + 1] << 16) |
+                                      ((uint)fileData[position + 2] << 8) | 
+                                      (uint)fileData[position + 3];
+                
+                int chunkLength = (int)chunkLengthUni;
+                
+                if (chunkLength < 0)
+                {
+                     _logger.Error("Invalid negative chunk length at position {Position}: {Length}", position, chunkLength);
+                     return false;
+                }
+
+                int totalChunkSize = 12 + chunkLength; // length(4) + type(4) + data(n) + crc(4)
+
+                // Safety check: ensure we don't read past end of file
+                if (position + totalChunkSize > fileData.Length)
+                {
+                    _logger.Error("Chunk size {ChunkSize} at position {Position} exceeds file size {FileSize}", 
+                        totalChunkSize, position, fileData.Length);
+                    return false;
+                }
 
                 // Read chunk type (4 bytes)
                 string chunkType = Encoding.ASCII.GetString(fileData, position + 4, 4);
-
-                int totalChunkSize = 12 + chunkLength; // length(4) + type(4) + data(n) + crc(4)
 
                 // Remove existing XMP chunk if present
                 if (chunkType == "iTXt" && chunkLength > 22)
                 {
                     // Check if this is an XMP chunk by looking for "XML:com.adobe.xmp"
+                    // Safe because we verified totalChunkSize fits in fileData
                     string keyword = Encoding.ASCII.GetString(fileData, position + 8, Math.Min(22, chunkLength));
                     if (keyword.StartsWith("XML:com.adobe.xmp"))
                     {
@@ -221,6 +248,12 @@ public class PngWebpMetadataWriter
                 // Write this chunk
                 outputStream.Write(fileData, position, totalChunkSize);
                 position += totalChunkSize;
+                
+                // If we found IEND, we are effectively done, but we'll let loop finish naturally (or break)
+                if (chunkType == "IEND")
+                {
+                    break;
+                }
             }
 
             // Write the modified file

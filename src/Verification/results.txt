@@ -1,0 +1,10 @@
+Starting Verification...
+Creating dummy image (3000x2000)...
+Created image at C:\Users\Kalai\AppData\Local\Temp\tmp5isrt3.tmp.png. Size: 27 KB
+Resizing to max dimension 1000...
+Resized image created at C:\Users\Kalai\AppData\Local\Temp\irissort_resize_87d437de-06c1-4798-a51c-780d9e39fa0d.png
+Resized dimensions: 1000x666
+Original Ratio: 1.5000
+New Ratio: 1.5015
+SUCCESS: Aspect ratio preserved.
+SUCCESS: Dimensions are correct.

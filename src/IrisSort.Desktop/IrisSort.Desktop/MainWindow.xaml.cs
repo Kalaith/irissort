@@ -99,14 +99,16 @@ public partial class MainWindow : Window
     private readonly ObservableCollection<ResultViewModel> _results = new();
     private RenameSession? _lastSession;
 
-    public string ModelName => _config.Model;
-
     public MainWindow()
     {
         InitializeComponent();
 
-        // Initialize services
+        // Load persisted configuration
+        var savedConfig = ConfigurationService.LoadConfiguration();
         _config = new LmStudioConfiguration();
+        ConfigurationService.ApplyToLmStudioConfiguration(savedConfig, _config);
+
+        // Initialize services
         _visionService = new LmStudioVisionService(_config);
         _analyzerService = new ImageAnalyzerService(_visionService, ownsVisionService: true);
         _folderScanner = new FolderScannerService();
@@ -132,13 +134,57 @@ public partial class MainWindow : Window
 
     private async void MainWindow_Loaded(object sender, RoutedEventArgs e)
     {
+        MaxDimTextBox.Text = _config.MaxImageDimension.ToString();
         await CheckConnectionAsync();
+    }
+
+    private void MaxDimTextBox_KeyDown(object sender, KeyEventArgs e)
+    {
+        if (e.Key == Key.Enter)
+        {
+            // Remove focus to trigger LostFocus logic
+            Keyboard.ClearFocus();
+        }
+    }
+
+    private void MaxDimTextBox_LostFocus(object sender, RoutedEventArgs e)
+    {
+        if (int.TryParse(MaxDimTextBox.Text, out int newDim))
+        {
+            if (newDim < 100) newDim = 100; // Minimum safety
+            if (newDim > 10000) newDim = 10000; // Maximum safety
+
+            if (_config.MaxImageDimension != newDim)
+            {
+                _config.MaxImageDimension = newDim;
+                
+                // Save configuration
+                try
+                {
+                    var configToSave = ConfigurationService.CreateFromLmStudioConfiguration(_config);
+                    ConfigurationService.SaveConfiguration(configToSave);
+                    StatusText.Text = $"Max dimension updated to {newDim}px";
+                }
+                catch (Exception ex)
+                {
+                    StatusText.Text = $"Failed to save settings: {ex.Message}";
+                }
+            }
+            // Update text box to match sanitized value
+            MaxDimTextBox.Text = newDim.ToString();
+        }
+        else
+        {
+            // Invalid input, revert
+            MaxDimTextBox.Text = _config.MaxImageDimension.ToString();
+        }
     }
 
     private async Task CheckConnectionAsync()
     {
         ConnectionStatus.Text = "LM Studio: Checking...";
         ConnectionIndicator.Fill = new SolidColorBrush(Colors.Orange);
+        ModelComboBox.IsEnabled = false;
 
         var isAvailable = await _visionService.IsAvailableAsync();
 
@@ -147,12 +193,119 @@ public partial class MainWindow : Window
             ConnectionStatus.Text = "LM Studio: Connected";
             ConnectionIndicator.Fill = (SolidColorBrush)FindResource("SuccessBrush");
             StatusText.Text = "Ready - LM Studio connected";
+
+            // Load available models
+            await LoadModelsAsync();
         }
         else
         {
             ConnectionStatus.Text = "LM Studio: Not Connected";
             ConnectionIndicator.Fill = (SolidColorBrush)FindResource("ErrorBrush");
             StatusText.Text = "Warning: Start LM Studio and load a vision model";
+            ModelComboBox.Items.Clear();
+            ModelComboBox.IsEnabled = false;
+        }
+    }
+
+    private async Task LoadModelsAsync()
+    {
+        try
+        {
+            var models = await _visionService.GetAvailableModelsAsync();
+
+            ModelComboBox.Items.Clear();
+
+            if (models.Length == 0)
+            {
+                ModelComboBox.Items.Add("(No models loaded)");
+                ModelComboBox.SelectedIndex = 0;
+                ModelComboBox.IsEnabled = false;
+                StatusText.Text = "Warning: No models loaded in LM Studio";
+                return;
+            }
+
+            foreach (var model in models)
+            {
+                ModelComboBox.Items.Add(model);
+            }
+
+            // Select current model if it's in the list, otherwise select first
+            var currentModel = _config.Model;
+            var matchIndex = -1;
+
+            for (int i = 0; i < ModelComboBox.Items.Count; i++)
+            {
+                if (ModelComboBox.Items[i].ToString() == currentModel)
+                {
+                    matchIndex = i;
+                    break;
+                }
+            }
+
+            if (matchIndex >= 0)
+            {
+                ModelComboBox.SelectedIndex = matchIndex;
+            }
+            else if (ModelComboBox.Items.Count > 0)
+            {
+                ModelComboBox.SelectedIndex = 0;
+            }
+
+            ModelComboBox.IsEnabled = true;
+        }
+        catch (Exception ex)
+        {
+            ModelComboBox.Items.Clear();
+            ModelComboBox.Items.Add("(Error loading models)");
+            ModelComboBox.SelectedIndex = 0;
+            ModelComboBox.IsEnabled = false;
+            StatusText.Text = $"Error loading models: {ex.Message}";
+        }
+    }
+
+    private void ModelComboBox_SelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
+    {
+        if (ModelComboBox.SelectedItem == null)
+            return;
+
+        var selectedModel = ModelComboBox.SelectedItem.ToString();
+
+        if (string.IsNullOrEmpty(selectedModel) || selectedModel.StartsWith("("))
+            return; // Ignore placeholder items
+
+        // Update configuration
+        _config.Model = selectedModel;
+
+        // Save configuration to disk
+        try
+        {
+            var configToSave = ConfigurationService.CreateFromLmStudioConfiguration(_config);
+            ConfigurationService.SaveConfiguration(configToSave);
+            StatusText.Text = $"Model changed to: {selectedModel}";
+        }
+        catch (Exception ex)
+        {
+            StatusText.Text = $"Model changed but failed to save: {ex.Message}";
+        }
+    }
+
+    private async void RefreshModelsButton_Click(object sender, RoutedEventArgs e)
+    {
+        RefreshModelsButton.IsEnabled = false;
+        StatusText.Text = "Refreshing model list...";
+
+        try
+        {
+            await LoadModelsAsync();
+            StatusText.Text = "Model list refreshed";
+        }
+        catch (Exception ex)
+        {
+            StatusText.Text = $"Error refreshing models: {ex.Message}";
+        }
+        finally
+        {
+            RefreshModelsButton.IsEnabled = true;
         }
     }
 
@@ -308,30 +461,63 @@ public partial class MainWindow : Window
             ProgressDetail.Text = p.fileName;
         });
 
+        List<ImageAnalysisResult>? results = null;
+        bool wasCancelled = false;
+
         try
         {
-            List<ImageAnalysisResult> results;
-
-            if (_isSingleFile)
+            try
             {
-                ProgressText.Text = "Analyzing image...";
-                var result = await _analyzerService.AnalyzeImageAsync(_selectedPath, _cancellationTokenSource.Token);
-                results = new List<ImageAnalysisResult> { result };
+                if (_isSingleFile)
+                {
+                    ProgressText.Text = "Analyzing image...";
+                    var result = await _analyzerService.AnalyzeImageAsync(_selectedPath, _cancellationTokenSource.Token);
+                    results = new List<ImageAnalysisResult> { result };
+                }
+                else
+                {
+                    results = await _analyzerService.AnalyzeDirectoryAsync(
+                        _selectedPath,
+                        recursive: false,
+                        progress,
+                        _cancellationTokenSource.Token);
+                }
             }
-            else
+            catch (OperationCanceledException)
             {
-                results = await _analyzerService.AnalyzeDirectoryAsync(
-                    _selectedPath,
-                    recursive: false,
-                    progress,
-                    _cancellationTokenSource.Token);
+                wasCancelled = true;
+                // results may be null or partial - we'll handle it below
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Analysis failed: {ex.Message}", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
+                StatusText.Text = "Analysis failed";
+                ProgressState.Visibility = Visibility.Collapsed;
+
+                // Show results if we have any, otherwise show empty state
+                if (_results.Count > 0)
+                {
+                    ResultsState.Visibility = Visibility.Visible;
+                }
+                else
+                {
+                    EmptyState.Visibility = Visibility.Visible;
+                }
+
+                return;
             }
 
+        // Process results if we have any (even partial results from cancellation)
+        if (results != null && results.Count > 0)
+        {
             // Update existing results or populate new ones
             if (hasExistingResults)
             {
                 // Update existing results
-                var resultsByPath = results.ToDictionary(r => r.OriginalPath, r => r);
+                var resultsByPath = results
+                    .GroupBy(r => r.OriginalPath, StringComparer.OrdinalIgnoreCase)
+                    .ToDictionary(g => g.Key, g => g.First(), StringComparer.OrdinalIgnoreCase);
+
                 foreach (var vm in _results)
                 {
                     if (resultsByPath.TryGetValue(vm.Result.OriginalPath, out var newResult))
@@ -372,7 +558,19 @@ public partial class MainWindow : Window
             // Update summary
             var successCount = results.Count(r => r.Status == AnalysisStatus.Success);
             var failedCount = results.Count(r => r.Status == AnalysisStatus.Failed);
-            ResultsSummary.Text = $"{successCount} images analyzed" + (failedCount > 0 ? $", {failedCount} failed" : "");
+            var pendingCount = _results.Count(r => r.Result.Status == AnalysisStatus.Pending);
+
+            if (wasCancelled)
+            {
+                ResultsSummary.Text = $"Analysis cancelled: {successCount} completed" +
+                                      (failedCount > 0 ? $", {failedCount} failed" : "") +
+                                      (pendingCount > 0 ? $", {pendingCount} not analyzed" : "");
+            }
+            else
+            {
+                ResultsSummary.Text = $"{successCount} images analyzed" +
+                                      (failedCount > 0 ? $", {failedCount} failed" : "");
+            }
 
             // Switch to results state
             ProgressState.Visibility = Visibility.Collapsed;
@@ -381,7 +579,12 @@ public partial class MainWindow : Window
             // Apply button will be enabled when user checks items (via ResultViewModel_ApprovalChanged)
 
             // Show error details if any failed
-            if (failedCount > 0)
+            if (wasCancelled)
+            {
+                StatusText.Text = $"Analysis cancelled: {successCount} images completed successfully" +
+                                  (pendingCount > 0 ? $", {pendingCount} not analyzed" : "");
+            }
+            else if (failedCount > 0)
             {
                 var firstError = results.FirstOrDefault(r => r.Status == AnalysisStatus.Failed)?.ErrorMessage ?? "";
                 // Truncate long error messages
@@ -396,23 +599,50 @@ public partial class MainWindow : Window
                 StatusText.Text = $"Analysis complete: {successCount} images processed";
             }
         }
-        catch (OperationCanceledException)
+        else if (wasCancelled)
         {
-            StatusText.Text = "Analysis cancelled";
+            // Cancelled with no results
+            StatusText.Text = "Analysis cancelled - no images were analyzed";
+            ProgressState.Visibility = Visibility.Collapsed;
+
+            // Show results if we already had some, otherwise show empty state
+            if (_results.Count > 0)
+            {
+                ResultsState.Visibility = Visibility.Visible;
+            }
+            else
+            {
+                EmptyState.Visibility = Visibility.Visible;
+            }
+        }
+        else
+        {
+            // No results and not cancelled - shouldn't happen but handle gracefully
+            StatusText.Text = "No results returned";
             ProgressState.Visibility = Visibility.Collapsed;
             EmptyState.Visibility = Visibility.Visible;
-            ApplyButton.IsEnabled = false;
+        }
         }
         catch (Exception ex)
         {
-            MessageBox.Show($"Analysis failed: {ex.Message}", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
-            StatusText.Text = "Analysis failed";
+            // Catch any unexpected exceptions during result processing
+            MessageBox.Show($"Error processing results: {ex.Message}", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
+            StatusText.Text = $"Error: {ex.Message}";
             ProgressState.Visibility = Visibility.Collapsed;
-            EmptyState.Visibility = Visibility.Visible;
-            ApplyButton.IsEnabled = false;
+
+            // Show results if we have any, otherwise show empty state
+            if (_results.Count > 0)
+            {
+                ResultsState.Visibility = Visibility.Visible;
+            }
+            else
+            {
+                EmptyState.Visibility = Visibility.Visible;
+            }
         }
         finally
         {
+            // Cleanup: always re-enable buttons and dispose cancellation token
             AnalyzeButton.IsEnabled = true;
             SelectFolderButton.IsEnabled = true;
             SelectFileButton.IsEnabled = true;
@@ -515,7 +745,9 @@ public partial class MainWindow : Window
                 StatusText.Text = "Renaming files...";
 
                 // Build lookup for metadata writing during rename
-                var resultsByPath = approvedResults.ToDictionary(r => r.OriginalPath, r => r);
+                var resultsByPath = approvedResults
+                    .GroupBy(r => r.OriginalPath, StringComparer.OrdinalIgnoreCase)
+                    .ToDictionary(g => g.Key, g => g.First(), StringComparer.OrdinalIgnoreCase);
                 session = await _renamePlanner.ExecuteRenamesAsync(operations, resultsByPath, writeMetadata: false); // Metadata already written above
 
                 await _undoManager.SaveSessionAsync(session);

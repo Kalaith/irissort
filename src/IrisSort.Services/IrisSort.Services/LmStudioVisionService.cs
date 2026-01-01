@@ -20,6 +20,11 @@ public class LmStudioVisionService : IDisposable
     private readonly ILogger _logger;
     private bool _disposed;
 
+    /// <summary>
+    /// Gets the current configuration.
+    /// </summary>
+    public LmStudioConfiguration Configuration => _config;
+
     public LmStudioVisionService(LmStudioConfiguration config, HttpClient? httpClient = null, ILogger? logger = null)
     {
         _config = config ?? throw new ArgumentNullException(nameof(config));

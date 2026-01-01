@@ -34,4 +34,19 @@ public static class Constants
     /// Maximum number of tags to display in UI preview.
     /// </summary>
     public const int MaxTagsDisplayCount = 5;
+
+    /// <summary>
+    /// Maximum image file size in bytes before resizing is triggered (4MB).
+    /// </summary>
+    public const long MaxImageSizeBytes = 4 * 1024 * 1024;
+
+    /// <summary>
+    /// Maximum width or height for resized images (maintains aspect ratio).
+    /// </summary>
+    public const int MaxImageDimension = 2048;
+
+    /// <summary>
+    /// Quality setting for resized JPEG/WebP images (0-100).
+    /// </summary>
+    public const int ResizedImageQuality = 85;
 }

@@ -50,8 +50,13 @@ public class FolderScannerService
                 var pattern = $"*{extension}";
                 try
                 {
-                    files.AddRange(Directory.GetFiles(path, pattern, searchOption)
-                        .Where(f => !IsHiddenOrSystem(f)));
+                    var foundFiles = Directory.GetFiles(path, pattern, searchOption)
+                        .Where(f => !IsHiddenOrSystem(f));
+                    
+                    foreach (var file in foundFiles)
+                    {
+                        files.Add(file);
+                    }
                 }
                 catch (UnauthorizedAccessException ex)
                 {
