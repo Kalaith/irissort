@@ -3,8 +3,7 @@ using IrisSort.Core.Models;
 using IrisSort.Services.Logging;
 using Serilog;
 using TagLib;
-using XmpCore;
-using XmpCore.Options;
+using System.Security; // Added for SecurityElement.Escape
 
 namespace IrisSort.Services;
 
@@ -23,6 +22,7 @@ public class PngWebpMetadataWriter
 
     /// <summary>
     /// Writes metadata to PNG or WEBP file using XMP chunks.
+    /// Manually constructs XMP XML to satisfy Windows Explorer quirks.
     /// </summary>
     public async Task<bool> WriteMetadataAsync(
         ImageAnalysisResult result,
@@ -43,126 +43,128 @@ public class PngWebpMetadataWriter
             {
                 _logger.Debug("Writing XMP metadata to {Extension} file: {TargetPath}", extension, targetPath);
 
-                // Read the file
-                byte[] fileBytes = System.IO.File.ReadAllBytes(targetPath);
-
-                // Create XMP metadata
-                var xmp = XmpMetaFactory.Create();
-
-                int fieldsWritten = 0;
-
-                // Write Dublin Core metadata (dc:)
-                if (!string.IsNullOrEmpty(result.Title))
-                {
-                    xmp.SetLocalizedText(XmpConstants.NsDC, "title", XmpConstants.XDefault, XmpConstants.XDefault, result.Title);
-                    _logger.Debug("Set XMP dc:title = {Title}", result.Title);
-                    fieldsWritten++;
-                }
-
-                if (!string.IsNullOrEmpty(result.Subject))
-                {
-                    xmp.SetLocalizedText(XmpConstants.NsDC, "description", XmpConstants.XDefault, XmpConstants.XDefault, result.Subject);
-                    _logger.Debug("Set XMP dc:description = {Subject}", result.Subject);
-                    fieldsWritten++;
-                }
-
-                // Write tags/keywords
-                if (result.FinalTags.Count > 0)
-                {
-                    foreach (var tag in result.FinalTags)
-                    {
-                        xmp.AppendArrayItem(XmpConstants.NsDC, "subject", new PropertyOptions { IsArray = true }, tag, null);
-                    }
-                    _logger.Debug("Set XMP dc:subject (keywords) = {Tags}", string.Join(", ", result.FinalTags));
-                    fieldsWritten++;
-                }
-
-                // Write rights/copyright
-                if (!string.IsNullOrEmpty(result.Copyright))
-                {
-                    xmp.SetLocalizedText(XmpConstants.NsDC, "rights", XmpConstants.XDefault, XmpConstants.XDefault, result.Copyright);
-                    _logger.Debug("Set XMP dc:rights = {Copyright}", result.Copyright);
-                    fieldsWritten++;
-                }
-
-                // Write creator/author
-                if (!string.IsNullOrEmpty(result.Authors))
-                {
-                    xmp.AppendArrayItem(XmpConstants.NsDC, "creator", new PropertyOptions { IsArray = true }, result.Authors, null);
-                    _logger.Debug("Set XMP dc:creator = {Authors}", result.Authors);
-                    fieldsWritten++;
-                }
-
-                // Write extended description/comments as EXIF UserComment
-                var fullDescription = result.Description;
-                if (!string.IsNullOrEmpty(result.Comments))
-                {
-                    fullDescription = string.IsNullOrEmpty(fullDescription)
-                        ? result.Comments
-                        : $"{fullDescription}\n\n{result.Comments}";
-                }
-
-                if (!string.IsNullOrEmpty(fullDescription))
-                {
-                    xmp.SetProperty(XmpConstants.NsExif, "UserComment", fullDescription);
-                    _logger.Debug("Set XMP exif:UserComment (description/comments)");
-                    fieldsWritten++;
-                }
-
-                if (fieldsWritten == 0)
-                {
-                    _logger.Warning("No metadata fields to write for {TargetPath}", targetPath);
-                    return false;
-                }
-
-                // Serialize XMP to string
-                var xmpString = XmpMetaFactory.SerializeToString(xmp, new SerializeOptions
-                {
-                    UseCompactFormat = false,
-                    OmitPacketWrapper = false,
-                    Indent = "  "
-                });
-
+                // Generate Windows-compatible XMP String
+                string xmpString = GenerateWindowsCompatibleXmp(result);
                 _logger.Debug("Generated XMP metadata ({Length} bytes)", xmpString.Length);
 
-                // For PNG files, inject XMP as iTXt chunk
+                // For PNG files, inject XMP iTXt
                 if (extension == ".png")
                 {
-                    if (InjectPngXmp(targetPath, xmpString))
+                    if (InjectPngMetadata(targetPath, xmpString))
                     {
-                        _logger.Information("Successfully wrote {FieldCount} XMP fields to PNG: {TargetPath}",
-                            fieldsWritten, targetPath);
+                        _logger.Information("Successfully wrote metadata to PNG: {TargetPath}", targetPath);
                         return true;
                     }
                     else
                     {
-                        _logger.Error("Failed to inject XMP into PNG: {TargetPath}", targetPath);
+                        _logger.Error("Failed to inject metadata into PNG: {TargetPath}", targetPath);
                         return false;
                     }
                 }
-                // For WEBP files, we need to use a different approach
+                // For WEBP files, we use TagLib# fallback as before
                 else if (extension == ".webp")
                 {
-                    _logger.Warning("WEBP XMP writing not fully supported - attempting basic metadata write. File: {TargetPath}", targetPath);
-                    // WEBP XMP requires modifying the RIFF chunks - more complex
-                    // Try basic approach using TagLib# as fallback
-                    return TryWriteWebpBasic(targetPath, result, fieldsWritten);
+                    _logger.Warning("WEBP XMP writing not fully supported - attempting basic simple write.");
+                    return TryWriteWebpBasic(targetPath, result);
                 }
 
                 return false;
             }
             catch (Exception ex)
             {
-                _logger.Error(ex, "Error writing XMP metadata to {TargetPath}", targetPath);
+                _logger.Error(ex, "Error writing metadata to {TargetPath}", targetPath);
                 return false;
             }
         }, cancellationToken);
     }
 
+    private string GenerateWindowsCompatibleXmp(ImageAnalysisResult result)
+    {
+        // Windows Explorer is very picky about XMP structure in PNGs.
+        // It prefers separate rdf:Description blocks for different namespaces.
+        // We manually build this string to ensure maximum compatibility.
+
+        var sb = new StringBuilder();
+        string uuid = "uuid:faf5bdd5-ba3d-11da-ad31-d33d75182f1b"; // Standard generic UUID
+
+        sb.Append("<?xpacket begin='?' id='W5M0MpCehiHzreSzNTczkc9d'?>");
+        sb.Append("<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">");
+
+        // 1. User Comment / Description (exif:UserComment)
+        var fullDescription = result.Description;
+        if (!string.IsNullOrEmpty(result.Comments))
+        {
+            fullDescription = string.IsNullOrEmpty(fullDescription)
+                ? result.Comments
+                : $"{fullDescription}\n\n{result.Comments}";
+        }
+
+        if (!string.IsNullOrEmpty(fullDescription))
+        {
+            // Sanitize XML
+            string cleanDesc = System.Security.SecurityElement.Escape(fullDescription);
+            
+            sb.Append($"<rdf:Description rdf:about=\"{uuid}\" xmlns:exif=\"http://ns.adobe.com/exif/1.0/\">");
+            sb.Append("<exif:UserComment><rdf:Alt xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">");
+            sb.Append($"<rdf:li xml:lang=\"x-default\">{cleanDesc}</rdf:li>");
+            sb.Append("</rdf:Alt></exif:UserComment>");
+            sb.Append("</rdf:Description>");
+        }
+
+        // 2. Keywords / Subject (dc:subject)
+        if (result.FinalTags != null && result.FinalTags.Count > 0)
+        {
+            sb.Append($"<rdf:Description rdf:about=\"{uuid}\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\">");
+            sb.Append("<dc:subject><rdf:Bag xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">");
+            foreach (var tag in result.FinalTags)
+            {
+                sb.Append($"<rdf:li>{System.Security.SecurityElement.Escape(tag)}</rdf:li>");
+            }
+            sb.Append("</rdf:Bag></dc:subject>");
+            sb.Append("</rdf:Description>");
+        }
+
+        // 3. Title (dc:title)
+        if (!string.IsNullOrEmpty(result.Title))
+        {
+            sb.Append($"<rdf:Description rdf:about=\"{uuid}\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\">");
+            sb.Append("<dc:title><rdf:Alt xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">");
+            sb.Append($"<rdf:li xml:lang=\"x-default\">{System.Security.SecurityElement.Escape(result.Title)}</rdf:li>");
+            sb.Append("</rdf:Alt></dc:title>");
+            sb.Append("</rdf:Description>");
+        }
+        
+        // 4. Author / Creator (dc:creator)
+        if (!string.IsNullOrEmpty(result.Authors))
+        {
+             sb.Append($"<rdf:Description rdf:about=\"{uuid}\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\">");
+             sb.Append("<dc:creator><rdf:Seq xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">");
+             sb.Append($"<rdf:li>{System.Security.SecurityElement.Escape(result.Authors)}</rdf:li>");
+             sb.Append("</rdf:Seq></dc:creator>");
+             sb.Append("</rdf:Description>");
+        }
+        
+        // 5. Rights / Copyright (dc:rights)
+        if (!string.IsNullOrEmpty(result.Copyright))
+        {
+            sb.Append($"<rdf:Description rdf:about=\"{uuid}\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\">");
+            sb.Append("<dc:rights><rdf:Alt xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">");
+            sb.Append($"<rdf:li xml:lang=\"x-default\">{System.Security.SecurityElement.Escape(result.Copyright)}</rdf:li>");
+            sb.Append("</rdf:Alt></dc:rights>");
+            sb.Append("</rdf:Description>");
+        }
+
+        sb.Append("</rdf:RDF></x:xmpmeta>");
+        sb.Append("<?xpacket end='w'?>");
+
+        return sb.ToString();
+    }
+
     /// <summary>
-    /// Injects XMP metadata into a PNG file as an iTXt chunk.
+    /// Injects XMP (iTXt) chunk into a PNG file.
+    /// Inserts it before the first IDAT chunk for compatibility.
     /// </summary>
-    private bool InjectPngXmp(string filePath, string xmpString)
+    private bool InjectPngMetadata(string filePath, string xmpString)
     {
         try
         {
@@ -183,145 +185,128 @@ public class PngWebpMetadataWriter
             outputStream.Write(fileData, 0, 8);
 
             int position = 8;
-            bool xmpInserted = false;
+            bool metadataInserted = false;
 
             // Parse PNG chunks
-            while (position < fileData.Length) // Changed condition to handle inside loop
+            while (position < fileData.Length)
             {
-                // We need at least 12 bytes for a chunk (Length 4 + Type 4 + CRC 4, Data 0)
-                if (position + 12 > fileData.Length)
-                {
-                    _logger.Warning("Unexpected end of file while reading chunk header at position {Position}", position);
-                    break;
-                }
+                if (position + 12 > fileData.Length) break;
 
-                // Read chunk length (4 bytes, big-endian)
-                // Use uint to prevent negative numbers if high bit is set (though standard PNG chunks are < 2^31)
                 uint chunkLengthUni = ((uint)fileData[position] << 24) | 
                                       ((uint)fileData[position + 1] << 16) |
                                       ((uint)fileData[position + 2] << 8) | 
                                       (uint)fileData[position + 3];
-                
                 int chunkLength = (int)chunkLengthUni;
                 
-                if (chunkLength < 0)
-                {
-                     _logger.Error("Invalid negative chunk length at position {Position}: {Length}", position, chunkLength);
-                     return false;
-                }
+                if (chunkLength < 0) return false;
 
-                int totalChunkSize = 12 + chunkLength; // length(4) + type(4) + data(n) + crc(4)
+                int totalChunkSize = 12 + chunkLength;
+                if (position + totalChunkSize > fileData.Length) return false;
 
-                // Safety check: ensure we don't read past end of file
-                if (position + totalChunkSize > fileData.Length)
-                {
-                    _logger.Error("Chunk size {ChunkSize} at position {Position} exceeds file size {FileSize}", 
-                        totalChunkSize, position, fileData.Length);
-                    return false;
-                }
-
-                // Read chunk type (4 bytes)
                 string chunkType = Encoding.ASCII.GetString(fileData, position + 4, 4);
 
-                // Remove existing XMP chunk if present
-                if (chunkType == "iTXt" && chunkLength > 22)
+                // Check for existing iTXt XMP to remove/skip
+                bool skipChunk = false;
+
+                if (chunkType == "iTXt")
                 {
-                    // Check if this is an XMP chunk by looking for "XML:com.adobe.xmp"
-                    // Safe because we verified totalChunkSize fits in fileData
-                    string keyword = Encoding.ASCII.GetString(fileData, position + 8, Math.Min(22, chunkLength));
-                    if (keyword.StartsWith("XML:com.adobe.xmp"))
-                    {
-                        _logger.Debug("Removing existing XMP iTXt chunk");
-                        position += totalChunkSize;
-                        continue; // Skip this chunk
-                    }
+                     // Read keyword to check if we should replace it
+                     int maxLen = Math.Min(chunkLength, 80); 
+                     byte[] keywordData = new byte[maxLen];
+                     Array.Copy(fileData, position + 8, keywordData, 0, maxLen);
+                     
+                     // Find null separator
+                     int nullIdx = Array.IndexOf(keywordData, (byte)0);
+                     if (nullIdx > 0)
+                     {
+                         string keyword = Encoding.ASCII.GetString(keywordData, 0, nullIdx);
+                         
+                         // If it's XMP, skip it (we will write our own)
+                         if (keyword.StartsWith("XML:com.adobe.xmp")) skipChunk = true;
+                     }
                 }
 
-                // Insert XMP before IEND chunk
-                if (chunkType == "IEND" && !xmpInserted)
+                // Critical: Insert Metadata BEFORE the first IDAT chunk
+                if (chunkType == "IDAT" && !metadataInserted)
                 {
-                    WriteXmpChunk(outputStream, xmpString);
-                    xmpInserted = true;
-                    _logger.Debug("Inserted XMP iTXt chunk before IEND");
+                    // Write XMP iTXt
+                    WriteITXtChunk(outputStream, "XML:com.adobe.xmp", xmpString);
+                    metadataInserted = true;
+                    _logger.Debug("Inserted XMP iTXt chunk before IDAT");
                 }
 
-                // Write this chunk
-                outputStream.Write(fileData, position, totalChunkSize);
+                if (!skipChunk)
+                {
+                    outputStream.Write(fileData, position, totalChunkSize);
+                }
+                else
+                {
+                    _logger.Debug("Removing existing metadata chunk: {Type}", chunkType);
+                }
+
                 position += totalChunkSize;
-                
-                // If we found IEND, we are effectively done, but we'll let loop finish naturally (or break)
-                if (chunkType == "IEND")
+
+                // If we hit IEND (and for some reason IDAT wasn't found before it, e.g. text-only PNG? unlikely)
+                if (chunkType == "IEND" && !metadataInserted)
                 {
-                    break;
+                     // Technically should be before IEND?
                 }
             }
+            
+            // Edge case: empty image or no IDAT found? 
+            if (!metadataInserted)
+            {
+                WriteITXtChunk(outputStream, "XML:com.adobe.xmp", xmpString);
+            }
 
-            // Write the modified file
             System.IO.File.WriteAllBytes(filePath, outputStream.ToArray());
-
-            return xmpInserted;
+            return true;
         }
         catch (Exception ex)
         {
-            _logger.Error(ex, "Failed to inject XMP into PNG file {FilePath}", filePath);
+            _logger.Error(ex, "Failed to inject metadata into PNG {FilePath}", filePath);
             return false;
         }
     }
 
-    /// <summary>
-    /// Writes an iTXt chunk containing XMP metadata.
-    /// </summary>
-    private void WriteXmpChunk(Stream stream, string xmpString)
+    private void WriteITXtChunk(Stream stream, string keyword, string text)
     {
-        // Keyword for XMP
-        const string keyword = "XML:com.adobe.xmp";
         byte[] keywordBytes = Encoding.UTF8.GetBytes(keyword);
-        byte[] xmpBytes = Encoding.UTF8.GetBytes(xmpString);
-
-        // iTXt chunk structure:
-        // - Keyword (null-terminated)
-        // - Compression flag (1 byte) - 0 for uncompressed
-        // - Compression method (1 byte) - 0
-        // - Language tag (null-terminated) - empty for XMP
-        // - Translated keyword (null-terminated) - empty for XMP
-        // - Text (UTF-8)
+        byte[] textBytes = Encoding.UTF8.GetBytes(text);
 
         using var chunkData = new MemoryStream();
         chunkData.Write(keywordBytes, 0, keywordBytes.Length);
-        chunkData.WriteByte(0); // Null terminator
-        chunkData.WriteByte(0); // Compression flag (uncompressed)
-        chunkData.WriteByte(0); // Compression method
-        chunkData.WriteByte(0); // Language tag (null-terminated, empty)
-        chunkData.WriteByte(0); // Translated keyword (null-terminated, empty)
-        chunkData.Write(xmpBytes, 0, xmpBytes.Length);
+        chunkData.WriteByte(0); // Null
+        chunkData.WriteByte(0); // Compression flag (0)
+        chunkData.WriteByte(0); // Compression method (0)
+        chunkData.WriteByte(0); // Lang tag (empty, null)
+        chunkData.WriteByte(0); // Trans keyword (empty, null)
+        chunkData.Write(textBytes, 0, textBytes.Length);
 
-        byte[] data = chunkData.ToArray();
-
-        // Write chunk length (big-endian)
-        int length = data.Length;
-        stream.WriteByte((byte)(length >> 24));
-        stream.WriteByte((byte)(length >> 16));
-        stream.WriteByte((byte)(length >> 8));
-        stream.WriteByte((byte)length);
-
-        // Write chunk type
-        byte[] type = Encoding.ASCII.GetBytes("iTXt");
-        stream.Write(type, 0, 4);
-
-        // Write chunk data
-        stream.Write(data, 0, data.Length);
-
-        // Calculate and write CRC
-        uint crc = CalculateCrc(type, data);
-        stream.WriteByte((byte)(crc >> 24));
-        stream.WriteByte((byte)(crc >> 16));
-        stream.WriteByte((byte)(crc >> 8));
-        stream.WriteByte((byte)crc);
+        WriteChunk(stream, "iTXt", chunkData.ToArray());
     }
 
-    /// <summary>
-    /// Calculates CRC32 for PNG chunk.
-    /// </summary>
+    private static void WriteChunk(Stream stream, string type, byte[] data)
+    {
+        // Length
+        byte[] len = BitConverter.GetBytes((uint)data.Length);
+        if (BitConverter.IsLittleEndian) Array.Reverse(len);
+        stream.Write(len, 0, 4);
+
+        // Type
+        byte[] typeBytes = Encoding.ASCII.GetBytes(type);
+        stream.Write(typeBytes, 0, 4);
+
+        // Data
+        stream.Write(data, 0, data.Length);
+
+        // CRC
+        uint crc = CalculateCrc(typeBytes, data);
+        byte[] crcBytes = BitConverter.GetBytes(crc);
+        if (BitConverter.IsLittleEndian) Array.Reverse(crcBytes);
+        stream.Write(crcBytes, 0, 4);
+    }
+
     private static uint CalculateCrc(byte[] type, byte[] data)
     {
         uint[] crcTable = new uint[256];
@@ -357,7 +342,7 @@ public class PngWebpMetadataWriter
     /// Attempts to write WEBP metadata using TagLib# as a fallback.
     /// WEBP support in TagLib# is limited, but we try anyway.
     /// </summary>
-    private bool TryWriteWebpBasic(string targetPath, ImageAnalysisResult result, int fieldsWritten)
+    private bool TryWriteWebpBasic(string targetPath, ImageAnalysisResult result)
     {
         try
         {

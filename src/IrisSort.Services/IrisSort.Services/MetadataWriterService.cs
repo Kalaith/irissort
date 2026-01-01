@@ -69,6 +69,21 @@ public class MetadataWriterService
 
                 int fieldsWritten = 0;
 
+                // CRITICAL FIX: For JPEGs, TagLib# doesn't automatically create XMP segments 
+                // if they don't exist. We must explicitly force creation.
+                if (extension == ".jpg" || extension == ".jpeg" || file.MimeType?.Contains("jpeg") == true)
+                {
+                    try 
+                    {
+                        var xmp = file.GetTag(TagTypes.XMP, true);
+                        if (xmp != null) _logger.Debug("Ensured XMP tag segment exists");
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.Warning("Failed to force create XMP tag: {Message}", ex.Message);
+                    }
+                }
+
                 // Write Title
                 if (!string.IsNullOrEmpty(result.Title))
                 {

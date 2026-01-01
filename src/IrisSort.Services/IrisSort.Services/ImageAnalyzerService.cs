@@ -1,7 +1,6 @@
 using System.Collections.Concurrent;
 using IrisSort.Core.Models;
-using IrisSort.Services.Configuration;
-using IrisSort.Services.Configuration;
+
 using IrisSort.Services.Exceptions;
 using SkiaSharp;
 
