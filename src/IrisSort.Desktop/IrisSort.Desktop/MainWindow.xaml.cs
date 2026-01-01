@@ -9,6 +9,7 @@ using IrisSort.Core.Models;
 using IrisSort.Services;
 using IrisSort.Services.Configuration;
 using Microsoft.Win32;
+using Constants = IrisSort.Services.Constants;
 
 namespace IrisSort.Desktop;
 
@@ -25,14 +26,39 @@ public class ResultViewModel : INotifyPropertyChanged
     }
 
     public string OriginalFilename => _result.OriginalFilename;
-    public string SuggestedFilename => _result.SuggestedFilename;
+    public string SuggestedFilename => string.IsNullOrEmpty(_result.SuggestedFilename) ? "(not analyzed)" : _result.SuggestedFilename;
     public string Title => _result.Title;
     public string Subject => _result.Subject;
-    public string TagsDisplay => string.Join(", ", _result.Tags.Take(5)) + (_result.Tags.Count > 5 ? "..." : "");
+    public string TagsDisplay => string.Join(", ", _result.Tags.Take(Constants.MaxTagsDisplayCount)) +
+                                  (_result.Tags.Count > Constants.MaxTagsDisplayCount ? "..." : "");
     
-    public string StatusDisplay => _result.Status == AnalysisStatus.Failed 
-        ? $"Failed: {_result.ErrorMessage?.Substring(0, Math.Min(50, _result.ErrorMessage?.Length ?? 0))}" 
-        : _result.Status.ToString();
+    public string StatusDisplay
+    {
+        get
+        {
+            if (_result.Status == AnalysisStatus.Failed)
+            {
+                if (string.IsNullOrEmpty(_result.ErrorMessage))
+                    return "Failed";
+
+                var maxLength = Math.Min(Constants.MaxErrorMessagePreviewLength, _result.ErrorMessage.Length);
+                return $"Failed: {_result.ErrorMessage.Substring(0, maxLength)}";
+            }
+            else if (_result.Status == AnalysisStatus.Pending)
+            {
+                return "Ready";
+            }
+            return _result.Status.ToString();
+        }
+    }
+
+    public void UpdateAfterRename(string newFilename)
+    {
+        _result.OriginalFilename = newFilename;
+        _result.SuggestedFilename = Path.GetFileNameWithoutExtension(newFilename);
+        OnPropertyChanged(nameof(OriginalFilename));
+        OnPropertyChanged(nameof(SuggestedFilename));
+    }
 
     public bool IsApproved
     {
@@ -41,13 +67,17 @@ public class ResultViewModel : INotifyPropertyChanged
         {
             _result.IsApproved = value;
             OnPropertyChanged();
+            ApprovalChanged?.Invoke(this, EventArgs.Empty);
         }
     }
+
+    public event EventHandler? ApprovalChanged;
 
     public ImageAnalysisResult Result => _result;
 
     public event PropertyChangedEventHandler? PropertyChanged;
-    protected void OnPropertyChanged([CallerMemberName] string? name = null)
+
+    public void OnPropertyChanged([CallerMemberName] string? name = null)
         => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
 }
 
@@ -69,6 +99,8 @@ public partial class MainWindow : Window
     private readonly ObservableCollection<ResultViewModel> _results = new();
     private RenameSession? _lastSession;
 
+    public string ModelName => _config.Model;
+
     public MainWindow()
     {
         InitializeComponent();
@@ -76,16 +108,26 @@ public partial class MainWindow : Window
         // Initialize services
         _config = new LmStudioConfiguration();
         _visionService = new LmStudioVisionService(_config);
-        _analyzerService = new ImageAnalyzerService(_visionService);
+        _analyzerService = new ImageAnalyzerService(_visionService, ownsVisionService: true);
         _folderScanner = new FolderScannerService();
         _renamePlanner = new RenamePlannerService();
         _undoManager = new UndoManagerService();
+
+        // Set DataContext for binding
+        DataContext = this;
 
         // Bind results list
         ResultsListView.ItemsSource = _results;
 
         // Check connection on startup
         Loaded += MainWindow_Loaded;
+
+        // Dispose services on window close
+        Closed += (s, e) =>
+        {
+            _analyzerService?.Dispose();
+            _cancellationTokenSource?.Dispose();
+        };
     }
 
     private async void MainWindow_Loaded(object sender, RoutedEventArgs e)
@@ -114,7 +156,7 @@ public partial class MainWindow : Window
         }
     }
 
-    private void SelectFolderButton_Click(object sender, RoutedEventArgs e)
+    private async void SelectFolderButton_Click(object sender, RoutedEventArgs e)
     {
         var dialog = new OpenFolderDialog
         {
@@ -126,8 +168,61 @@ public partial class MainWindow : Window
             _selectedPath = dialog.FolderName;
             _isSingleFile = false;
             SelectedPathText.Text = _selectedPath;
+
+            // Scan and show files immediately
+            await ShowFilesInFolderAsync(_selectedPath);
+        }
+    }
+
+    private async Task ShowFilesInFolderAsync(string folderPath)
+    {
+        try
+        {
+            _results.Clear();
+
+            // Scan directory for image files
+            var files = await _folderScanner.ScanDirectoryAsync(folderPath, recursive: false);
+
+            if (files.Count == 0)
+            {
+                StatusText.Text = "No image files found in selected folder";
+                EmptyState.Visibility = Visibility.Visible;
+                ResultsState.Visibility = Visibility.Collapsed;
+                AnalyzeButton.IsEnabled = false;
+                return;
+            }
+
+            // Show files in results list as "pending"
+            foreach (var filePath in files)
+            {
+                var fileInfo = new FileInfo(filePath);
+                var pendingResult = new ImageAnalysisResult
+                {
+                    OriginalPath = filePath,
+                    OriginalFilename = fileInfo.Name,
+                    Extension = fileInfo.Extension.ToLowerInvariant(),
+                    FileSizeBytes = fileInfo.Length,
+                    Status = AnalysisStatus.Pending,
+                    SuggestedFilename = "" // Empty until analyzed
+                };
+
+                var vm = new ResultViewModel(pendingResult);
+                vm.ApprovalChanged += ResultViewModel_ApprovalChanged;
+                _results.Add(vm);
+            }
+
+            // Show results state
+            EmptyState.Visibility = Visibility.Collapsed;
+            ResultsState.Visibility = Visibility.Visible;
+            ResultsSummary.Text = $"{files.Count} images found - ready to analyze";
+            StatusText.Text = $"Found {files.Count} images. Click 'Analyze' to generate metadata.";
             AnalyzeButton.IsEnabled = true;
-            StatusText.Text = $"Selected folder: {_selectedPath}";
+            ApplyButton.IsEnabled = false; // Disable until analysis is done
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"Error scanning folder: {ex.Message}", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
+            StatusText.Text = "Error scanning folder";
         }
     }
 
@@ -144,8 +239,32 @@ public partial class MainWindow : Window
             _selectedPath = dialog.FileName;
             _isSingleFile = true;
             SelectedPathText.Text = _selectedPath;
+
+            // Show the single file in the list
+            _results.Clear();
+
+            var fileInfo = new FileInfo(_selectedPath);
+            var pendingResult = new ImageAnalysisResult
+            {
+                OriginalPath = _selectedPath,
+                OriginalFilename = fileInfo.Name,
+                Extension = fileInfo.Extension.ToLowerInvariant(),
+                FileSizeBytes = fileInfo.Length,
+                Status = AnalysisStatus.Pending,
+                SuggestedFilename = "" // Empty until analyzed
+            };
+
+            var vm = new ResultViewModel(pendingResult);
+            vm.ApprovalChanged += ResultViewModel_ApprovalChanged;
+            _results.Add(vm);
+
+            // Show results state
+            EmptyState.Visibility = Visibility.Collapsed;
+            ResultsState.Visibility = Visibility.Visible;
+            ResultsSummary.Text = "1 image selected - ready to analyze";
+            StatusText.Text = $"Selected file: {Path.GetFileName(_selectedPath)}. Click 'Analyze' to generate metadata.";
             AnalyzeButton.IsEnabled = true;
-            StatusText.Text = $"Selected file: {Path.GetFileName(_selectedPath)}";
+            ApplyButton.IsEnabled = false; // Disable until analysis is done
         }
     }
 
@@ -176,7 +295,9 @@ public partial class MainWindow : Window
         SelectFolderButton.IsEnabled = false;
         SelectFileButton.IsEnabled = false;
 
-        _results.Clear();
+        // If results are already populated (from folder scan), keep them; otherwise clear
+        bool hasExistingResults = _results.Count > 0;
+
         _cancellationTokenSource = new CancellationTokenSource();
 
         var progress = new Progress<(int current, int total, string fileName)>(p =>
@@ -206,10 +327,46 @@ public partial class MainWindow : Window
                     _cancellationTokenSource.Token);
             }
 
-            // Populate results
-            foreach (var result in results)
+            // Update existing results or populate new ones
+            if (hasExistingResults)
             {
-                _results.Add(new ResultViewModel(result));
+                // Update existing results
+                var resultsByPath = results.ToDictionary(r => r.OriginalPath, r => r);
+                foreach (var vm in _results)
+                {
+                    if (resultsByPath.TryGetValue(vm.Result.OriginalPath, out var newResult))
+                    {
+                        // Copy all the analyzed data into the existing result
+                        vm.Result.SuggestedFilename = newResult.SuggestedFilename;
+                        vm.Result.Tags = newResult.Tags;
+                        vm.Result.Description = newResult.Description;
+                        vm.Result.Title = newResult.Title;
+                        vm.Result.Subject = newResult.Subject;
+                        vm.Result.Comments = newResult.Comments;
+                        vm.Result.Authors = newResult.Authors;
+                        vm.Result.Copyright = newResult.Copyright;
+                        vm.Result.VisibleDate = newResult.VisibleDate;
+                        vm.Result.Status = newResult.Status;
+                        vm.Result.ErrorMessage = newResult.ErrorMessage;
+                        vm.Result.FileHash = newResult.FileHash;
+                        vm.Result.AnalyzedAt = newResult.AnalyzedAt;
+                        vm.OnPropertyChanged(nameof(vm.SuggestedFilename));
+                        vm.OnPropertyChanged(nameof(vm.Title));
+                        vm.OnPropertyChanged(nameof(vm.Subject));
+                        vm.OnPropertyChanged(nameof(vm.TagsDisplay));
+                        vm.OnPropertyChanged(nameof(vm.StatusDisplay));
+                    }
+                }
+            }
+            else
+            {
+                // Populate results from scratch
+                foreach (var result in results)
+                {
+                    var vm = new ResultViewModel(result);
+                    vm.ApprovalChanged += ResultViewModel_ApprovalChanged;
+                    _results.Add(vm);
+                }
             }
 
             // Update summary
@@ -220,15 +377,17 @@ public partial class MainWindow : Window
             // Switch to results state
             ProgressState.Visibility = Visibility.Collapsed;
             ResultsState.Visibility = Visibility.Visible;
-            
+
+            // Apply button will be enabled when user checks items (via ResultViewModel_ApprovalChanged)
+
             // Show error details if any failed
             if (failedCount > 0)
             {
                 var firstError = results.FirstOrDefault(r => r.Status == AnalysisStatus.Failed)?.ErrorMessage ?? "";
                 // Truncate long error messages
-                if (firstError.Length > 80)
+                if (firstError.Length > Constants.MaxErrorMessageStatusLength)
                 {
-                    firstError = firstError.Substring(0, 80) + "...";
+                    firstError = firstError.Substring(0, Constants.MaxErrorMessageStatusLength) + "...";
                 }
                 StatusText.Text = $"Analysis complete: {successCount} ok, {failedCount} failed. Last error: {firstError}";
             }
@@ -242,6 +401,7 @@ public partial class MainWindow : Window
             StatusText.Text = "Analysis cancelled";
             ProgressState.Visibility = Visibility.Collapsed;
             EmptyState.Visibility = Visibility.Visible;
+            ApplyButton.IsEnabled = false;
         }
         catch (Exception ex)
         {
@@ -249,6 +409,7 @@ public partial class MainWindow : Window
             StatusText.Text = "Analysis failed";
             ProgressState.Visibility = Visibility.Collapsed;
             EmptyState.Visibility = Visibility.Visible;
+            ApplyButton.IsEnabled = false;
         }
         finally
         {
@@ -290,13 +451,21 @@ public partial class MainWindow : Window
 
         if (approvedResults.Count == 0)
         {
-            MessageBox.Show("No images selected for renaming.", "Nothing to Apply", MessageBoxButton.OK, MessageBoxImage.Information);
+            MessageBox.Show("No images selected for processing.", "Nothing to Apply", MessageBoxButton.OK, MessageBoxImage.Information);
             return;
         }
 
+        // Count how many will be renamed vs just metadata updates
+        var operations = _renamePlanner.PlanRenames(approvedResults);
+        var metadataOnlyCount = approvedResults.Count - operations.Count;
+
+        var message = operations.Count > 0
+            ? $"This will:\n- Rename {operations.Count} file(s)\n- Update metadata for {approvedResults.Count} file(s)\n\nContinue?"
+            : $"This will update metadata for {approvedResults.Count} file(s) (no renames).\n\nContinue?";
+
         var confirm = MessageBox.Show(
-            $"This will rename {approvedResults.Count} image(s).\n\nContinue?",
-            "Confirm Rename",
+            message,
+            "Confirm Changes",
             MessageBoxButton.YesNo,
             MessageBoxImage.Question);
 
@@ -310,32 +479,109 @@ public partial class MainWindow : Window
 
         try
         {
-            var operations = _renamePlanner.PlanRenames(approvedResults);
-            
-            // Build lookup for metadata writing
-            var resultsByPath = approvedResults.ToDictionary(r => r.OriginalPath, r => r);
-            var session = await _renamePlanner.ExecuteRenamesAsync(operations, resultsByPath, writeMetadata: true);
+            var metadataWriter = new MetadataWriterService();
+            int metadataSuccessCount = 0;
+            int metadataFailCount = 0;
 
-            await _undoManager.SaveSessionAsync(session);
-            _lastSession = session;
+            // First, write metadata to ALL approved files (including those not being renamed)
+            foreach (var result in approvedResults)
+            {
+                try
+                {
+                    StatusText.Text = $"Writing metadata to {Path.GetFileName(result.OriginalPath)}...";
+                    var success = await metadataWriter.WriteMetadataAsync(result, result.OriginalPath, CancellationToken.None);
 
-            StatusText.Text = $"Renamed {session.SuccessCount} files" + 
-                              (session.FailedCount > 0 ? $" ({session.FailedCount} failed)" : "");
+                    if (success)
+                    {
+                        metadataSuccessCount++;
+                    }
+                    else
+                    {
+                        metadataFailCount++;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    metadataFailCount++;
+                    // Log but continue with other files
+                    System.Diagnostics.Debug.WriteLine($"Metadata write failed for {result.OriginalPath}: {ex.Message}");
+                }
+            }
 
-            UndoButton.IsEnabled = true;
+            // Then, rename the files that need it
+            RenameSession? session = null;
+            if (operations.Count > 0)
+            {
+                StatusText.Text = "Renaming files...";
 
-            // Clear results
-            _results.Clear();
-            ResultsState.Visibility = Visibility.Collapsed;
-            EmptyState.Visibility = Visibility.Visible;
+                // Build lookup for metadata writing during rename
+                var resultsByPath = approvedResults.ToDictionary(r => r.OriginalPath, r => r);
+                session = await _renamePlanner.ExecuteRenamesAsync(operations, resultsByPath, writeMetadata: false); // Metadata already written above
+
+                await _undoManager.SaveSessionAsync(session);
+                _lastSession = session;
+
+                UndoButton.IsEnabled = true;
+
+                // Update the displayed filenames to show the new names
+                var operationsByOriginalPath = session.Operations
+                    .Where(o => o.WasSuccessful)
+                    .ToDictionary(o => o.OriginalPath, o => o);
+
+                foreach (var vm in _results)
+                {
+                    if (operationsByOriginalPath.TryGetValue(vm.Result.OriginalPath, out var operation))
+                    {
+                        // Update to show the new filename
+                        var newFilename = Path.GetFileName(operation.NewPath);
+                        vm.UpdateAfterRename(newFilename);
+
+                        // Update the OriginalPath so undo will work
+                        vm.Result.OriginalPath = operation.NewPath;
+
+                        // Mark as no longer approved since it's been renamed
+                        vm.IsApproved = false;
+                    }
+                }
+
+                ResultsSummary.Text = $"{session.SuccessCount} files renamed" +
+                                      (session.FailedCount > 0 ? $", {session.FailedCount} failed" : "") +
+                                      $" | {metadataSuccessCount} metadata updated" +
+                                      (metadataFailCount > 0 ? $" ({metadataFailCount} failed)" : "");
+
+                StatusText.Text = $"Renamed {session.SuccessCount} files, updated {metadataSuccessCount} metadata" +
+                                  (session.FailedCount > 0 ? $" ({session.FailedCount} rename failed)" : "") +
+                                  (metadataFailCount > 0 ? $" ({metadataFailCount} metadata failed)" : "");
+            }
+            else
+            {
+                // Metadata-only update, no renames
+                ResultsSummary.Text = $"{metadataSuccessCount} metadata updated" +
+                                      (metadataFailCount > 0 ? $" ({metadataFailCount} failed)" : "");
+
+                StatusText.Text = $"Updated metadata for {metadataSuccessCount} files" +
+                                  (metadataFailCount > 0 ? $" ({metadataFailCount} failed)" : "");
+
+                // Uncheck all since metadata has been written
+                foreach (var vm in _results)
+                {
+                    if (vm.IsApproved)
+                    {
+                        vm.IsApproved = false;
+                    }
+                }
+            }
+
+            // Keep the results visible to show the updated names
+            ResultsState.Visibility = Visibility.Visible;
+
+            // Disable Apply button since all items are now unchecked
+            ApplyButton.IsEnabled = false;
         }
         catch (Exception ex)
         {
             MessageBox.Show($"Failed to apply changes: {ex.Message}", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
-        }
-        finally
-        {
-            ApplyButton.IsEnabled = true;
+            ApplyButton.IsEnabled = true; // Re-enable on error so user can retry
         }
     }
 
@@ -419,5 +665,11 @@ Error: {result.ErrorMessage ?? "None"}";
             Clipboard.SetText(details);
             StatusText.Text = "All details copied to clipboard";
         }
+    }
+
+    private void ResultViewModel_ApprovalChanged(object? sender, EventArgs e)
+    {
+        // Enable Apply button if at least one item is approved
+        ApplyButton.IsEnabled = _results.Any(r => r.IsApproved && r.Result.Status == AnalysisStatus.Success);
     }
 }

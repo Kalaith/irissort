@@ -1,24 +1,32 @@
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using IrisSort.Services.Configuration;
 using IrisSort.Services.Exceptions;
+using IrisSort.Services.Logging;
 using IrisSort.Services.Models;
+using Serilog;
 
 namespace IrisSort.Services;
 
 /// <summary>
 /// Service for analyzing images using LM Studio's vision-capable local LLM.
 /// </summary>
-public class LmStudioVisionService
+public class LmStudioVisionService : IDisposable
 {
     private readonly LmStudioConfiguration _config;
     private readonly HttpClient _httpClient;
+    private readonly bool _ownsHttpClient;
+    private readonly ILogger _logger;
+    private bool _disposed;
 
-    public LmStudioVisionService(LmStudioConfiguration config, HttpClient? httpClient = null)
+    public LmStudioVisionService(LmStudioConfiguration config, HttpClient? httpClient = null, ILogger? logger = null)
     {
         _config = config ?? throw new ArgumentNullException(nameof(config));
+        _ownsHttpClient = httpClient == null;
         _httpClient = httpClient ?? new HttpClient();
         _httpClient.Timeout = TimeSpan.FromSeconds(_config.TimeoutSeconds);
+        _logger = logger ?? LoggerFactory.CreateLogger<LmStudioVisionService>();
     }
 
     /// <summary>
@@ -98,9 +106,9 @@ public class LmStudioVisionService
         };
 
         var jsonPayload = JsonSerializer.Serialize(payload);
-        Console.WriteLine($"[LmStudio] Sending request to {_config.ChatCompletionsEndpoint}");
-        Console.WriteLine($"[LmStudio] Model: {_config.Model}");
-        Console.WriteLine($"[LmStudio] Image size: {imageData.Length} bytes, MIME: {mimeType}");
+        _logger.Debug("Sending request to {Endpoint}", _config.ChatCompletionsEndpoint);
+        _logger.Debug("Model: {Model}", _config.Model);
+        _logger.Debug("Image size: {Size} bytes, MIME: {MimeType}", imageData.Length, mimeType);
 
         var request = new HttpRequestMessage(HttpMethod.Post, _config.ChatCompletionsEndpoint)
         {
@@ -112,8 +120,8 @@ public class LmStudioVisionService
             var response = await _httpClient.SendAsync(request, cancellationToken);
             var responseContent = await response.Content.ReadAsStringAsync(cancellationToken);
 
-            Console.WriteLine($"[LmStudio] Response status: {response.StatusCode}");
-            Console.WriteLine($"[LmStudio] Response: {responseContent.Substring(0, Math.Min(500, responseContent.Length))}");
+            _logger.Debug("Response status: {StatusCode}", response.StatusCode);
+            _logger.Debug("Response: {Response}", responseContent.Substring(0, Math.Min(Constants.MaxResponsePreviewLength, responseContent.Length)));
 
             if (!response.IsSuccessStatusCode)
             {
@@ -126,12 +134,12 @@ public class LmStudioVisionService
         }
         catch (HttpRequestException ex)
         {
-            Console.WriteLine($"[LmStudio] HTTP error: {ex.Message}");
+            _logger.Error(ex, "HTTP error communicating with LM Studio");
             throw new LmStudioApiException($"Failed to communicate with LM Studio: {ex.Message}", ex);
         }
         catch (TaskCanceledException ex)
         {
-            Console.WriteLine($"[LmStudio] Timeout or cancelled");
+            _logger.Warning("Request to LM Studio timed out or was cancelled");
             throw new LmStudioApiException("Request to LM Studio timed out", ex);
         }
         catch (LmStudioApiException)
@@ -140,7 +148,7 @@ public class LmStudioVisionService
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[LmStudio] Unexpected error: {ex.GetType().Name}: {ex.Message}");
+            _logger.Error(ex, "Unexpected error during LM Studio API call");
             throw new LmStudioApiException($"Unexpected error: {ex.Message}", ex);
         }
     }
@@ -168,7 +176,7 @@ public class LmStudioVisionService
                 // Retry on server errors
                 lastException = ex;
                 attempt++;
-                Console.WriteLine($"[LmStudio] Server error, attempt {attempt}/{_config.MaxRetries}");
+                _logger.Warning("Server error on attempt {Attempt}/{MaxRetries}: {Message}", attempt, _config.MaxRetries, ex.Message);
                 if (attempt < _config.MaxRetries)
                 {
                     await Task.Delay(TimeSpan.FromSeconds(Math.Pow(2, attempt)), cancellationToken);
@@ -177,7 +185,7 @@ public class LmStudioVisionService
             catch (LmStudioApiException ex) when (ex.StatusCode >= 400 && ex.StatusCode < 500)
             {
                 // Client errors - don't retry
-                Console.WriteLine($"[LmStudio] Client error (no retry): {ex.Message}");
+                _logger.Error("Client error (no retry): {Message}", ex.Message);
                 throw;
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
@@ -185,7 +193,7 @@ public class LmStudioVisionService
                 // Network or other errors - retry
                 lastException = ex;
                 attempt++;
-                Console.WriteLine($"[LmStudio] Error, attempt {attempt}/{_config.MaxRetries}: {ex.Message}");
+                _logger.Warning("Error on attempt {Attempt}/{MaxRetries}: {Message}", attempt, _config.MaxRetries, ex.Message);
                 if (attempt < _config.MaxRetries)
                 {
                     await Task.Delay(TimeSpan.FromSeconds(Math.Pow(2, attempt)), cancellationToken);
@@ -200,8 +208,8 @@ public class LmStudioVisionService
 
     private ImageAnalysisApiResponse ParseResponse(string responseContent)
     {
-        Console.WriteLine($"[LmStudio] Parsing response...");
-        
+        _logger.Debug("Parsing response");
+
         ChatCompletionResponse? chatResponse;
         try
         {
@@ -209,18 +217,18 @@ public class LmStudioVisionService
         }
         catch (JsonException ex)
         {
-            Console.WriteLine($"[LmStudio] Failed to parse outer response: {ex.Message}");
+            _logger.Error(ex, "Failed to parse outer API response");
             throw new LmStudioApiException($"Failed to parse API response: {ex.Message}", ex);
         }
 
         if (chatResponse?.Choices == null || chatResponse.Choices.Length == 0)
         {
-            Console.WriteLine($"[LmStudio] No choices in response");
+            _logger.Error("No choices in API response");
             throw new LmStudioApiException("No choices returned from LM Studio");
         }
 
         var messageContent = chatResponse.Choices[0].Message?.Content;
-        Console.WriteLine($"[LmStudio] Raw response length: {messageContent?.Length ?? 0}");
+        _logger.Debug("Raw response length: {Length}", messageContent?.Length ?? 0);
         
         if (string.IsNullOrEmpty(messageContent))
         {
@@ -229,8 +237,8 @@ public class LmStudioVisionService
 
         // Try to extract JSON from the response (model might include extra text)
         var jsonContent = ExtractJson(messageContent);
-        Console.WriteLine($"[LmStudio] Extracted JSON length: {jsonContent.Length}");
-        Console.WriteLine($"[LmStudio] Extracted JSON preview: {jsonContent.Substring(0, Math.Min(300, jsonContent.Length))}");
+        _logger.Debug("Extracted JSON length: {Length}", jsonContent.Length);
+        _logger.Debug("Extracted JSON preview: {Preview}", jsonContent.Substring(0, Math.Min(Constants.MaxJsonPreviewLength, jsonContent.Length)));
 
         try
         {
@@ -250,17 +258,16 @@ public class LmStudioVisionService
             // Sanitize the filename
             analysisResponse.SuggestedFilename = SanitizeFilename(analysisResponse.SuggestedFilename);
 
-            Console.WriteLine($"[LmStudio] Parsed successfully:");
-            Console.WriteLine($"  - Filename: {analysisResponse.SuggestedFilename}");
-            Console.WriteLine($"  - Title: {analysisResponse.Title}");
-            Console.WriteLine($"  - Tags: {string.Join(", ", analysisResponse.Tags ?? new List<string>())}");
-            
+            _logger.Information("Parsed successfully - Filename: {Filename}, Title: {Title}, Tags: {Tags}",
+                analysisResponse.SuggestedFilename,
+                analysisResponse.Title,
+                string.Join(", ", analysisResponse.Tags ?? new List<string>()));
+
             return analysisResponse;
         }
         catch (JsonException ex)
         {
-            Console.WriteLine($"[LmStudio] JSON parse error: {ex.Message}");
-            Console.WriteLine($"[LmStudio] JSON content that failed: {jsonContent}");
+            _logger.Error(ex, "JSON parse error. Content: {JsonContent}", jsonContent);
             throw new LmStudioApiException($"JSON parse failed: {ex.Message}", ex);
         }
     }
@@ -269,7 +276,7 @@ public class LmStudioVisionService
     /// Attempts to extract JSON object from a string that might contain extra text.
     /// Handles <think> tags, markdown code blocks, and other wrapper text.
     /// </summary>
-    private static string ExtractJson(string content)
+    private string ExtractJson(string content)
     {
         if (string.IsNullOrWhiteSpace(content))
         {
@@ -326,9 +333,9 @@ public class LmStudioVisionService
     /// <summary>
     /// Attempts to repair truncated JSON by closing unclosed brackets.
     /// </summary>
-    private static string RepairTruncatedJson(string json)
+    private string RepairTruncatedJson(string json)
     {
-        Console.WriteLine("[LmStudio] Attempting to repair truncated JSON");
+        _logger.Warning("Attempting to repair truncated JSON");
         
         // Count unclosed brackets
         int braces = 0;
@@ -370,7 +377,7 @@ public class LmStudioVisionService
             json += "}";
         }
 
-        Console.WriteLine($"[LmStudio] Repaired JSON (added {brackets} ] and {braces} }})");
+        _logger.Debug("Repaired JSON (added {Brackets} ] and {Braces} }})", brackets, braces);
         return json;
     }
 
@@ -398,19 +405,16 @@ public class LmStudioVisionService
         // Replace spaces with underscores
         filename = filename.Replace(' ', '_');
 
-        // Remove consecutive underscores
-        while (filename.Contains("__"))
-        {
-            filename = filename.Replace("__", "_");
-        }
+        // Remove consecutive underscores using regex (more efficient)
+        filename = Regex.Replace(filename, "_+", "_");
 
         // Trim underscores from start and end
         filename = filename.Trim('_');
 
         // Limit length
-        if (filename.Length > 100)
+        if (filename.Length > Constants.MaxFilenameLength)
         {
-            filename = filename.Substring(0, 100).TrimEnd('_');
+            filename = filename.Substring(0, Constants.MaxFilenameLength).TrimEnd('_');
         }
 
         return string.IsNullOrEmpty(filename) ? "unnamed_image" : filename.ToLowerInvariant();
@@ -449,5 +453,30 @@ RULES:
 
 DO NOT GUESS authors, copyright, or visible_date. Only include if clearly visible in the image.
 Respond with ONLY the JSON object, no markdown, no explanation.";
+    }
+
+    /// <summary>
+    /// Disposes the service and releases resources.
+    /// </summary>
+    public void Dispose()
+    {
+        Dispose(true);
+        GC.SuppressFinalize(this);
+    }
+
+    /// <summary>
+    /// Disposes the service resources.
+    /// </summary>
+    protected virtual void Dispose(bool disposing)
+    {
+        if (_disposed)
+            return;
+
+        if (disposing && _ownsHttpClient)
+        {
+            _httpClient?.Dispose();
+        }
+
+        _disposed = true;
     }
 }

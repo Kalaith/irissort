@@ -1,5 +1,7 @@
 using System.Text.Json;
 using IrisSort.Core.Models;
+using IrisSort.Services.Logging;
+using Serilog;
 
 namespace IrisSort.Services;
 
@@ -9,13 +11,15 @@ namespace IrisSort.Services;
 public class UndoManagerService
 {
     private readonly string _logDirectory;
+    private readonly ILogger _logger;
     private RenameSession? _lastSession;
 
-    public UndoManagerService(string? logDirectory = null)
+    public UndoManagerService(string? logDirectory = null, ILogger? logger = null)
     {
         _logDirectory = logDirectory ?? Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "IrisSort", "logs");
+        _logger = logger ?? LoggerFactory.CreateLogger<UndoManagerService>();
 
         Directory.CreateDirectory(_logDirectory);
     }
@@ -59,9 +63,9 @@ public class UndoManagerService
                     return session;
                 }
             }
-            catch
+            catch (Exception ex)
             {
-                // Skip corrupted files
+                _logger.Warning(ex, "Failed to read session file {File}", file);
             }
         }
 
@@ -88,9 +92,9 @@ public class UndoManagerService
                     sessions.Add(session);
                 }
             }
-            catch
+            catch (Exception ex)
             {
-                // Skip corrupted files
+                _logger.Warning(ex, "Failed to read session file {File}", file);
             }
         }
 
@@ -124,9 +128,9 @@ public class UndoManagerService
             {
                 File.Delete(file);
             }
-            catch
+            catch (Exception ex)
             {
-                // Skip files in use
+                _logger.Warning(ex, "Failed to delete session file {File}", file);
             }
         }
         _lastSession = null;

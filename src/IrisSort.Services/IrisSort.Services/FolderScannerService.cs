@@ -1,4 +1,6 @@
 using IrisSort.Core.Models;
+using IrisSort.Services.Logging;
+using Serilog;
 
 namespace IrisSort.Services;
 
@@ -7,10 +9,16 @@ namespace IrisSort.Services;
 /// </summary>
 public class FolderScannerService
 {
+    private readonly ILogger _logger;
     private static readonly HashSet<string> SupportedExtensions = new(StringComparer.OrdinalIgnoreCase)
     {
         ".jpg", ".jpeg", ".png", ".webp"
     };
+
+    public FolderScannerService(ILogger? logger = null)
+    {
+        _logger = logger ?? LoggerFactory.CreateLogger<FolderScannerService>();
+    }
 
     /// <summary>
     /// Scans a directory for supported image files.
@@ -45,9 +53,9 @@ public class FolderScannerService
                     files.AddRange(Directory.GetFiles(path, pattern, searchOption)
                         .Where(f => !IsHiddenOrSystem(f)));
                 }
-                catch (UnauthorizedAccessException)
+                catch (UnauthorizedAccessException ex)
                 {
-                    // Skip directories we don't have access to
+                    _logger.Warning(ex, "Access denied to directory or files with pattern {Pattern}", pattern);
                 }
             }
 
@@ -95,7 +103,7 @@ public class FolderScannerService
         return Convert.ToHexString(hashBytes).ToLowerInvariant();
     }
 
-    private static bool IsHiddenOrSystem(string filePath)
+    private bool IsHiddenOrSystem(string filePath)
     {
         try
         {
@@ -103,8 +111,9 @@ public class FolderScannerService
             return (attributes & FileAttributes.Hidden) == FileAttributes.Hidden ||
                    (attributes & FileAttributes.System) == FileAttributes.System;
         }
-        catch
+        catch (Exception ex)
         {
+            _logger.Debug(ex, "Failed to get attributes for {FilePath}", filePath);
             return false;
         }
     }

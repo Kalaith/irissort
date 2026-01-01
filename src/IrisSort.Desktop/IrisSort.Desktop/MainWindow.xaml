@@ -185,8 +185,9 @@
                                 <Button x:Name="UndoButton" Content="↩ Undo Last" 
                                         Style="{StaticResource SecondaryButton}" Margin="0,0,8,0"
                                         IsEnabled="False" Click="UndoButton_Click"/>
-                                <Button x:Name="ApplyButton" Content="🚀 Apply Changes" 
+                                <Button x:Name="ApplyButton" Content="🚀 Apply Changes"
                                         Style="{StaticResource PrimaryButton}"
+                                        IsEnabled="False"
                                         Click="ApplyButton_Click"/>
                             </StackPanel>
                         </Border>
@@ -202,10 +203,12 @@
                     <ColumnDefinition Width="*"/>
                     <ColumnDefinition Width="Auto"/>
                 </Grid.ColumnDefinitions>
-                <TextBlock x:Name="StatusText" Text="Ready" FontSize="12" 
+                <TextBlock x:Name="StatusText" Text="Ready" FontSize="12"
                            Foreground="{StaticResource TextSecondaryBrush}"/>
-                <TextBlock Grid.Column="1" Text="Model: glm-4.6v-flash" FontSize="12" 
-                           Foreground="{StaticResource TextSecondaryBrush}"/>
+                <TextBlock Grid.Column="1" FontSize="12"
+                           Foreground="{StaticResource TextSecondaryBrush}">
+                    <Run Text="Model: "/><Run Text="{Binding ModelName, Mode=OneTime}"/>
+                </TextBlock>
             </Grid>
         </Border>
     </Grid>

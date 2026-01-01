@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using IrisSort.Core.Models;
 using IrisSort.Services.Configuration;
 using IrisSort.Services.Exceptions;
@@ -7,16 +8,19 @@ namespace IrisSort.Services;
 /// <summary>
 /// Orchestrates image analysis using the LM Studio vision service.
 /// </summary>
-public class ImageAnalyzerService
+public class ImageAnalyzerService : IDisposable
 {
     private readonly LmStudioVisionService _visionService;
     private readonly FolderScannerService _folderScanner;
-    private readonly Dictionary<string, ImageAnalysisResult> _cache = new();
+    private readonly bool _ownsVisionService;
+    private readonly ConcurrentDictionary<string, ImageAnalysisResult> _cache = new();
+    private bool _disposed;
 
-    public ImageAnalyzerService(LmStudioVisionService visionService, FolderScannerService? folderScanner = null)
+    public ImageAnalyzerService(LmStudioVisionService visionService, FolderScannerService? folderScanner = null, bool ownsVisionService = false)
     {
         _visionService = visionService ?? throw new ArgumentNullException(nameof(visionService));
         _folderScanner = folderScanner ?? new FolderScannerService();
+        _ownsVisionService = ownsVisionService;
     }
 
     /// <summary>
@@ -80,8 +84,8 @@ public class ImageAnalyzerService
             result.Status = AnalysisStatus.Success;
             result.AnalyzedAt = DateTime.Now;
 
-            // Cache result
-            _cache[result.FileHash] = result;
+            // Cache result (thread-safe)
+            _cache.AddOrUpdate(result.FileHash, result, (key, old) => result);
 
             return result;
         }
@@ -146,5 +150,30 @@ public class ImageAnalyzerService
     public void ClearCache()
     {
         _cache.Clear();
+    }
+
+    /// <summary>
+    /// Disposes the service and releases resources.
+    /// </summary>
+    public void Dispose()
+    {
+        Dispose(true);
+        GC.SuppressFinalize(this);
+    }
+
+    /// <summary>
+    /// Disposes the service resources.
+    /// </summary>
+    protected virtual void Dispose(bool disposing)
+    {
+        if (_disposed)
+            return;
+
+        if (disposing && _ownsVisionService)
+        {
+            _visionService?.Dispose();
+        }
+
+        _disposed = true;
     }
 }

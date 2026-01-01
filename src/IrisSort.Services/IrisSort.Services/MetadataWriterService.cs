@@ -1,4 +1,6 @@
 using IrisSort.Core.Models;
+using IrisSort.Services.Logging;
+using Serilog;
 using TagLib;
 using TagLib.Image;
 
@@ -9,6 +11,15 @@ namespace IrisSort.Services;
 /// </summary>
 public class MetadataWriterService
 {
+    private readonly ILogger _logger;
+    private readonly PngWebpMetadataWriter _pngWebpWriter;
+
+    public MetadataWriterService(ILogger? logger = null)
+    {
+        _logger = logger ?? LoggerFactory.CreateLogger<MetadataWriterService>();
+        _pngWebpWriter = new PngWebpMetadataWriter(logger);
+    }
+
     /// <summary>
     /// Writes metadata to an image file.
     /// </summary>
@@ -19,40 +30,66 @@ public class MetadataWriterService
     {
         if (!System.IO.File.Exists(targetPath))
         {
-            Console.WriteLine($"[MetadataWriter] File not found: {targetPath}");
+            _logger.Warning("File not found: {TargetPath}", targetPath);
             return false;
+        }
+
+        var extension = Path.GetExtension(targetPath).ToLowerInvariant();
+        _logger.Debug("Writing metadata to {Extension} file: {TargetPath}", extension, targetPath);
+
+        // Use specialized writer for PNG and WEBP files
+        if (extension == ".png" || extension == ".webp")
+        {
+            _logger.Information("Using specialized PNG/WEBP XMP writer for {Extension}", extension);
+            return await _pngWebpWriter.WriteMetadataAsync(result, targetPath, cancellationToken);
         }
 
         return await Task.Run(() =>
         {
             try
             {
-                Console.WriteLine($"[MetadataWriter] Writing metadata to: {targetPath}");
-
                 using var file = TagLib.File.Create(targetPath);
+
+                _logger.Debug("File type: {MimeType}, TagTypes: {TagTypes}",
+                    file.MimeType, file.TagTypes);
 
                 // Get or create image tag
                 var imageTag = file.Tag as CombinedImageTag;
-                
+
+                if (file.Tag == null)
+                {
+                    _logger.Error("File.Tag is null for {TargetPath}, cannot write metadata", targetPath);
+                    return false;
+                }
+
+                if (imageTag != null)
+                {
+                    _logger.Debug("Image tag type: {TagType}", imageTag.GetType().Name);
+                }
+
+                int fieldsWritten = 0;
+
                 // Write Title
                 if (!string.IsNullOrEmpty(result.Title))
                 {
                     file.Tag.Title = result.Title;
-                    Console.WriteLine($"[MetadataWriter] Title: {result.Title}");
+                    _logger.Debug("Set Title: {Title}", result.Title);
+                    fieldsWritten++;
                 }
 
                 // Write Subject/Description - map to Comment since JPEG doesn't have Subject
                 var description = result.Description;
                 if (!string.IsNullOrEmpty(result.Subject))
                 {
-                    description = string.IsNullOrEmpty(description) 
-                        ? result.Subject 
+                    description = string.IsNullOrEmpty(description)
+                        ? result.Subject
                         : $"{result.Subject} - {description}";
                 }
                 if (!string.IsNullOrEmpty(description))
                 {
                     file.Tag.Comment = description;
-                    Console.WriteLine($"[MetadataWriter] Comment: {description}");
+                    _logger.Debug("Set Comment: {Comment}", description);
+                    fieldsWritten++;
                 }
 
                 // Write Tags/Keywords
@@ -62,10 +99,12 @@ public class MetadataWriterService
                     if (imageTag != null)
                     {
                         imageTag.Keywords = result.FinalTags.ToArray();
+                        _logger.Debug("Set Keywords (image-specific): {Tags}", string.Join(", ", result.FinalTags));
                     }
                     // Also try to set as genres (works as fallback for some formats)
                     file.Tag.Genres = result.FinalTags.ToArray();
-                    Console.WriteLine($"[MetadataWriter] Tags: {string.Join(", ", result.FinalTags)}");
+                    _logger.Debug("Set Genres (fallback): {Tags}", string.Join(", ", result.FinalTags));
+                    fieldsWritten++;
                 }
 
                 // Write Authors/Artists
@@ -76,14 +115,16 @@ public class MetadataWriterService
                     {
                         imageTag.Creator = result.Authors;
                     }
-                    Console.WriteLine($"[MetadataWriter] Authors: {result.Authors}");
+                    _logger.Debug("Set Authors: {Authors}", result.Authors);
+                    fieldsWritten++;
                 }
 
                 // Write Copyright
                 if (!string.IsNullOrEmpty(result.Copyright))
                 {
                     file.Tag.Copyright = result.Copyright;
-                    Console.WriteLine($"[MetadataWriter] Copyright: {result.Copyright}");
+                    _logger.Debug("Set Copyright: {Copyright}", result.Copyright);
+                    fieldsWritten++;
                 }
 
                 // Add comments to extended comment if not empty
@@ -94,30 +135,66 @@ public class MetadataWriterService
                     if (!string.IsNullOrEmpty(existingComment))
                     {
                         file.Tag.Comment = $"{existingComment}\n\n{result.Comments}";
+                        _logger.Debug("Appended Comments to existing comment");
                     }
                     else
                     {
                         file.Tag.Comment = result.Comments;
+                        _logger.Debug("Set Comments: {Comments}", result.Comments);
                     }
+                    fieldsWritten++;
                 }
 
+                if (fieldsWritten == 0)
+                {
+                    _logger.Warning("No metadata fields to write for {TargetPath}", targetPath);
+                    return false;
+                }
+
+                _logger.Debug("Saving {FieldCount} metadata fields to file...", fieldsWritten);
+
                 file.Save();
-                Console.WriteLine($"[MetadataWriter] Successfully saved metadata");
+
+                _logger.Information("Successfully saved {FieldCount} metadata fields to {TargetPath} ({Extension})",
+                    fieldsWritten, targetPath, extension);
+
+                // Verify the save actually worked by reading back
+                try
+                {
+                    using var verifyFile = TagLib.File.Create(targetPath);
+                    bool hasData = !string.IsNullOrEmpty(verifyFile.Tag.Title) ||
+                                   !string.IsNullOrEmpty(verifyFile.Tag.Comment) ||
+                                   (verifyFile.Tag.Genres != null && verifyFile.Tag.Genres.Length > 0);
+
+                    if (!hasData)
+                    {
+                        _logger.Warning("Verification failed: No metadata found after save for {TargetPath}", targetPath);
+                        return false;
+                    }
+
+                    _logger.Debug("Verification passed: Metadata confirmed in {TargetPath}", targetPath);
+                }
+                catch (Exception ex)
+                {
+                    _logger.Warning(ex, "Could not verify metadata write for {TargetPath}", targetPath);
+                    // Still return true since the save appeared to succeed
+                }
+
                 return true;
             }
             catch (UnsupportedFormatException ex)
             {
-                Console.WriteLine($"[MetadataWriter] Unsupported format: {ex.Message}");
+                _logger.Warning(ex, "Unsupported format for {TargetPath}", targetPath);
                 return false;
             }
             catch (CorruptFileException ex)
             {
-                Console.WriteLine($"[MetadataWriter] Corrupt file: {ex.Message}");
+                _logger.Error(ex, "Corrupt file: {TargetPath}", targetPath);
                 return false;
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[MetadataWriter] Error: {ex.GetType().Name}: {ex.Message}");
+                _logger.Error(ex, "Error writing metadata to {TargetPath}", targetPath);
                 return false;
             }
         }, cancellationToken);
@@ -138,22 +215,22 @@ public class MetadataWriterService
         try
         {
             using var file = TagLib.File.Create(filePath);
-            
+
             // Try Keywords first (for images)
             if (file.Tag is CombinedImageTag imageTag && imageTag.Keywords != null)
             {
                 tags.AddRange(imageTag.Keywords);
             }
-            
+
             // Fall back to Genres
             if (tags.Count == 0 && file.Tag.Genres != null)
             {
                 tags.AddRange(file.Tag.Genres);
             }
         }
-        catch
+        catch (Exception ex)
         {
-            // Ignore errors when reading
+            _logger.Debug(ex, "Failed to read tags from {FilePath}", filePath);
         }
 
         return tags;

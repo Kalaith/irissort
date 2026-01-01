@@ -1,4 +1,6 @@
 using IrisSort.Core.Models;
+using IrisSort.Services.Logging;
+using Serilog;
 
 namespace IrisSort.Services;
 
@@ -7,6 +9,13 @@ namespace IrisSort.Services;
 /// </summary>
 public class RenamePlannerService
 {
+    private readonly ILogger _logger;
+
+    public RenamePlannerService(ILogger? logger = null)
+    {
+        _logger = logger ?? LoggerFactory.CreateLogger<RenamePlannerService>();
+    }
+
     /// <summary>
     /// Plans rename operations with collision resolution.
     /// </summary>
@@ -25,19 +34,21 @@ public class RenamePlannerService
             var baseName = newFilename;
             var counter = 1;
             var fullNewName = $"{newFilename}{extension}";
+            var potentialPath = Path.Combine(directory, fullNewName);
 
-            while (usedNames.ContainsKey(fullNewName) || 
-                   (File.Exists(Path.Combine(directory, fullNewName)) && 
-                    !Path.Combine(directory, fullNewName).Equals(result.OriginalPath, StringComparison.OrdinalIgnoreCase)))
+            while (usedNames.ContainsKey(fullNewName) ||
+                   (File.Exists(potentialPath) &&
+                    !potentialPath.Equals(result.OriginalPath, StringComparison.OrdinalIgnoreCase)))
             {
                 newFilename = $"{baseName}_{counter}";
                 fullNewName = $"{newFilename}{extension}";
+                potentialPath = Path.Combine(directory, fullNewName);
                 counter++;
             }
 
             usedNames[fullNewName] = 1;
 
-            var newPath = Path.Combine(directory, fullNewName);
+            var newPath = potentialPath;
 
             // Skip if same path
             if (newPath.Equals(result.OriginalPath, StringComparison.OrdinalIgnoreCase))
@@ -86,17 +97,31 @@ public class RenamePlannerService
                 operation.ExecutedAt = DateTime.Now;
 
                 // Write metadata if requested and we have the analysis result
-                if (metadataWriter != null && resultsByPath != null && 
+                if (metadataWriter != null && resultsByPath != null &&
                     resultsByPath.TryGetValue(operation.OriginalPath, out var result))
                 {
                     try
                     {
-                        await metadataWriter.WriteMetadataAsync(result, operation.NewPath, cancellationToken);
-                        operation.MetadataUpdated = true;
+                        // Small delay to ensure file handle is released after rename on Windows
+                        await Task.Delay(50, cancellationToken);
+
+                        var metadataWritten = await metadataWriter.WriteMetadataAsync(result, operation.NewPath, cancellationToken);
+                        operation.MetadataUpdated = metadataWritten;
+
+                        if (!metadataWritten)
+                        {
+                            _logger.Warning("Metadata write returned false for {NewPath}. Check logs for format support or file issues.", operation.NewPath);
+                            operation.ErrorMessage = $"File renamed but metadata write failed (check logs for details)";
+                        }
+                        else
+                        {
+                            _logger.Information("Metadata successfully written for {NewPath}", operation.NewPath);
+                        }
                     }
                     catch (Exception ex)
                     {
                         // Metadata write failed, but file was renamed
+                        _logger.Error(ex, "Metadata write exception for {NewPath}", operation.NewPath);
                         operation.ErrorMessage = $"File renamed but metadata write failed: {ex.Message}";
                     }
                 }
@@ -145,9 +170,10 @@ public class RenamePlannerService
                     File.Move(operation.NewPath, operation.OriginalPath);
                     reverted++;
                 }
-                catch
+                catch (Exception ex)
                 {
-                    // Failed to revert this file, continue with others
+                    _logger.Warning(ex, "Failed to revert file from {NewPath} to {OriginalPath}",
+                        operation.NewPath, operation.OriginalPath);
                 }
             }
 
