@@ -42,7 +42,7 @@ public class ProcessingOptions
     /// </summary>
     public List<string> SupportedExtensions { get; set; } = new()
     {
-        ".jpg", ".jpeg", ".png", ".webp"
+        ".jpg", ".jpeg", ".png", ".webp", ".gif"
     };
 }
 

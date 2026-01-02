@@ -12,7 +12,7 @@ public class FolderScannerService
     private readonly ILogger _logger;
     private static readonly HashSet<string> SupportedExtensions = new(StringComparer.OrdinalIgnoreCase)
     {
-        ".jpg", ".jpeg", ".png", ".webp"
+        ".jpg", ".jpeg", ".png", ".webp", ".gif"
     };
 
     public FolderScannerService(ILogger? logger = null)
@@ -93,6 +93,7 @@ public class FolderScannerService
             ".jpg" or ".jpeg" => "image/jpeg",
             ".png" => "image/png",
             ".webp" => "image/webp",
+            ".gif" => "image/gif",
             _ => "application/octet-stream"
         };
     }

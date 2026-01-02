@@ -1,95 +1,89 @@
 ﻿using System;
 using System.IO;
-using System.Collections.Generic;
-using System.Threading.Tasks;
-using IrisSort.Services;
-using IrisSort.Core.Models;
-using Serilog;
+using System.Text;
+using System.Linq;
 using TagLib;
 
 namespace VerificationMetadata
 {
     class Program
     {
-        static async Task Main(string[] args)
+        static void Main(string[] args)
         {
-            Log.Logger = new LoggerConfiguration().WriteTo.Console().CreateLogger();
-            
-            // Files
-            string brokenSource = @"h:\claude\irissort\annular_eclipse_view.jpg";
-            string testOutput = @"h:\claude\irissort\test_service_write.jpg";
-            string reencodedOutput = @"h:\claude\irissort\test_service_reencoded.jpg";
-
-            var result = new ImageAnalysisResult
-            {
-                Title = "Service Test Title",
-                Description = "Service Test Description",
-                Tags = new List<string> { "ServiceTag1", "ServiceTag2" },
-                Authors = "Service Author",
-                Copyright = "Service Copyright",
-                Comments = "Service Comment"
-            };
-
-            var service = new MetadataWriterService(Log.Logger);
-
-            Console.WriteLine("=== SERVICE TEST PHASE ===");
-            if (System.IO.File.Exists(brokenSource))
-            {
-                 // Test 1: Direct Write using Service (Should now work with the XMP fix)
-                 System.IO.File.Copy(brokenSource, testOutput, true);
-                 Console.WriteLine($"Attempting Service Write to: {Path.GetFileName(testOutput)}");
-                 
-                 // Use the Service
-                 bool success = await service.WriteMetadataAsync(result, testOutput);
-                 Console.WriteLine($"Service Write Result: {success}");
-                 
-                 InspectJpeg("DIRECT_SERVICE", testOutput);
-                 
-                 // Optional: Test Re-encode too just to be sure it doesn't break
-                 ReEncode(brokenSource, reencodedOutput);
-                 bool reSuccess = await service.WriteMetadataAsync(result, reencodedOutput);
-                 if (reSuccess) InspectJpeg("REENCODED_SERVICE", reencodedOutput);
-            }
+            string path = @"h:\claude\irissort\fantasy-warrior-monsters.jpg";
+            InspectFile(path);
         }
 
-        static void ReEncode(string source, string dest)
+        static void InspectFile(string path)
         {
-            Console.WriteLine($"\n[Re-Encode] Processing {Path.GetFileName(source)}...");
-            try 
+            Console.WriteLine($"Inspecting: {Path.GetFileName(path)}");
+            if (!File.Exists(path)) return;
+
+            // 1. Check TIFF Endianness (Exif)
+            try
             {
-                using var inputStream = System.IO.File.OpenRead(source);
-                using var originalBitmap = SkiaSharp.SKBitmap.Decode(inputStream);
-                using var image = SkiaSharp.SKImage.FromBitmap(originalBitmap);
-                using var data = image.Encode(SkiaSharp.SKEncodedImageFormat.Jpeg, 100);
+                using var fs = File.OpenRead(path);
+                // Scan for Exif header: 0xFF 0xE1 (APP1)
+                byte[] buffer = new byte[128];
+                fs.Read(buffer, 0, 128);
                 
-                using var outputStream = System.IO.File.OpenWrite(dest);
-                data.SaveTo(outputStream);
-                Console.WriteLine("Re-encode complete.");
+                // Simple heuristic scan
+                int exifIdx = -1;
+                for(int i=0; i<buffer.Length-6; i++)
+                {
+                    // Exif\0\0 header
+                    if(buffer[i] == 0x45 && buffer[i+1] == 0x78 && buffer[i+2] == 0x69 && 
+                       buffer[i+3] == 0x66 && buffer[i+4] == 0x00 && buffer[i+5] == 0x00)
+                    {
+                        exifIdx = i + 6;
+                        break;
+                    }
+                }
+
+                if(exifIdx != -1)
+                {
+                    // Next 2 bytes are TIFF Byte Order
+                    string order = $"{(char)buffer[exifIdx]}{(char)buffer[exifIdx+1]}";
+                    Console.WriteLine($"TIFF Byte Order: {order}"); // II = Little, MM = Big
+                    if (order == "MM") Console.WriteLine(">> WARNING: File is Big Endian!");
+                }
+                else
+                {
+                    Console.WriteLine("Could not locate simple Exif header in first 128 bytes.");
+                }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Re-encode failed: {ex.Message}");
+                Console.WriteLine($"Header Read Error: {ex.Message}");
             }
-        }
 
-        static void InspectJpeg(string label, string path)
-        {
-            Console.WriteLine($"[{label}] Inspecting: {Path.GetFileName(path)}");
-            if (!System.IO.File.Exists(path)) return;
-
+            // 2. TagLib Inspection
             try
             {
                 using var file = TagLib.File.Create(path);
-                Console.WriteLine($"Title: {file.Tag.Title}");
                 Console.WriteLine($"Comment: {file.Tag.Comment}");
-                Console.WriteLine($"Genres: {string.Join(", ", file.Tag.Genres)}");
                 
-                // Check if XMP is actually present in tag types
-                Console.WriteLine($"TagTypes: {file.TagTypes}");
+                // Check Raw Tags if possible (TagLib abstracts this, but we can check specific directories)
+                if (file.GetTag(TagTypes.Tiff) is TagLib.Image.ImageTag tiffTag)
+                {
+                     // Try to access XPComment (0x9C9C)
+                     // TagLib# usually exposes this via specific properties or raw tags... 
+                     // Actually TagLib# maps XPComment to Comment for display, but we want raw.
+                     Console.WriteLine("Inspecting directories...");
+                     // We can't easy get Raw tags via standard TagLib API without casting to internal types or ImageTag internals
+                }
+                
+                // Let's print the hex dump of the comment if we can access it
+                var comment = file.Tag.Comment;
+                if(!string.IsNullOrEmpty(comment))
+                {
+                    Console.WriteLine($"Comment Chars: {string.Join(" ", comment.Take(10).Select(c => ((int)c).ToString("X4")))}");
+                    if (comment.Length > 0 && comment[0] == 0x4120) Console.WriteLine(">> CONFIRMED: TagLib sees the Mojibake characters!");
+                }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Inspect Error: {ex.Message}");
+                 Console.WriteLine($"TagLib Error: {ex.Message}");
             }
         }
     }

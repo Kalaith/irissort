@@ -98,6 +98,9 @@ public partial class MainWindow : Window
     private bool _isSingleFile;
     private readonly ObservableCollection<ResultViewModel> _results = new();
     private RenameSession? _lastSession;
+    private bool _autoApplyEnabled;
+    private readonly ObservableCollection<AppliedChangeRecord> _appliedChanges = new();
+    private Guid _currentSessionId;
 
     public MainWindow()
     {
@@ -120,6 +123,7 @@ public partial class MainWindow : Window
 
         // Bind results list
         ResultsListView.ItemsSource = _results;
+        HistoryListView.ItemsSource = _appliedChanges;
 
         // Check connection on startup
         Loaded += MainWindow_Loaded;
@@ -384,7 +388,7 @@ public partial class MainWindow : Window
         var dialog = new OpenFileDialog
         {
             Title = "Select image to analyze",
-            Filter = "Image files (*.jpg;*.jpeg;*.png;*.webp)|*.jpg;*.jpeg;*.png;*.webp|All files (*.*)|*.*"
+            Filter = "Image files (*.jpg;*.jpeg;*.png;*.webp;*.gif)|*.jpg;*.jpeg;*.png;*.webp;*.gif|All files (*.*)|*.*"
         };
 
         if (dialog.ShowDialog() == true)
@@ -451,6 +455,14 @@ public partial class MainWindow : Window
         // If results are already populated (from folder scan), keep them; otherwise clear
         bool hasExistingResults = _results.Count > 0;
 
+        // Initialize for auto-apply if enabled
+        if (_autoApplyEnabled)
+        {
+            _currentSessionId = Guid.NewGuid();
+            _appliedChanges.Clear();
+            _lastSession = null;
+        }
+
         _cancellationTokenSource = new CancellationTokenSource();
 
         var progress = new Progress<(int current, int total, string fileName)>(p =>
@@ -473,13 +485,27 @@ public partial class MainWindow : Window
                     ProgressText.Text = "Analyzing image...";
                     var result = await _analyzerService.AnalyzeImageAsync(_selectedPath, _cancellationTokenSource.Token);
                     results = new List<ImageAnalysisResult> { result };
+
+                    // Auto-apply for single file if enabled
+                    if (_autoApplyEnabled && result.Status == AnalysisStatus.Success)
+                    {
+                        await ApplySingleResultAsync(result);
+                    }
                 }
                 else
                 {
+                    // Setup auto-apply callback if enabled
+                    Func<ImageAnalysisResult, Task>? callback = null;
+                    if (_autoApplyEnabled)
+                    {
+                        callback = ApplySingleResultAsync;
+                    }
+
                     results = await _analyzerService.AnalyzeDirectoryAsync(
                         _selectedPath,
                         recursive: false,
                         progress,
+                        callback,
                         _cancellationTokenSource.Token);
                 }
             }
@@ -510,6 +536,22 @@ public partial class MainWindow : Window
         // Process results if we have any (even partial results from cancellation)
         if (results != null && results.Count > 0)
         {
+            // Check if auto-apply is enabled
+            // If auto-apply was enabled, changes were already applied in real-time via callback
+            // So we just show the history summary instead of applying again
+            if (_autoApplyEnabled && !wasCancelled && _appliedChanges.Count > 0)
+            {
+                // Show history view with real-time applied changes
+                ShowAutoApplyHistory();
+                return;
+            }
+            else if (_autoApplyEnabled && !wasCancelled)
+            {
+                // Fallback: bulk auto-apply if callback didn't work for some reason
+                await AutoApplyChangesAsync(results);
+                return;
+            }
+
             // Update existing results or populate new ones
             if (hasExistingResults)
             {
@@ -903,5 +945,388 @@ Error: {result.ErrorMessage ?? "None"}";
     {
         // Enable Apply button if at least one item is approved
         ApplyButton.IsEnabled = _results.Any(r => r.IsApproved && r.Result.Status == AnalysisStatus.Success);
+    }
+
+    private async Task ApplySingleResultAsync(ImageAnalysisResult result)
+    {
+        // This is called immediately after each file is analyzed
+        // Apply changes (metadata + rename) in real-time
+
+        if (_currentSessionId == Guid.Empty)
+        {
+            _currentSessionId = Guid.NewGuid();
+        }
+
+        try
+        {
+            // Mark as approved (required for PlanRenames)
+            result.IsApproved = true;
+
+            // Write metadata first
+            var metadataWriter = new MetadataWriterService();
+            var metadataSuccess = await metadataWriter.WriteMetadataAsync(result, result.OriginalPath, CancellationToken.None);
+
+            // Plan and execute rename if needed
+            var operations = _renamePlanner.PlanRenames(new[] { result });
+
+            if (operations.Count > 0)
+            {
+                var operation = operations[0];
+                var resultsByPath = new Dictionary<string, ImageAnalysisResult>(StringComparer.OrdinalIgnoreCase)
+                {
+                    { result.OriginalPath, result }
+                };
+
+                var session = await _renamePlanner.ExecuteRenamesAsync(operations, resultsByPath, writeMetadata: false);
+
+                if (session.SuccessCount > 0)
+                {
+                    var op = session.Operations[0];
+                    _appliedChanges.Add(new AppliedChangeRecord
+                    {
+                        OriginalFilename = Path.GetFileName(op.OriginalPath),
+                        NewFilename = Path.GetFileName(op.NewPath),
+                        OriginalPath = op.OriginalPath,
+                        NewPath = op.NewPath,
+                        WasRenamed = true,
+                        MetadataWritten = metadataSuccess,
+                        AppliedAt = DateTime.Now,
+                        SessionId = _currentSessionId
+                    });
+
+                    // Update the session for undo
+                    if (_lastSession == null)
+                    {
+                        _lastSession = session;
+                        await _undoManager.SaveSessionAsync(session);
+                    }
+                    else
+                    {
+                        _lastSession.Operations.AddRange(session.Operations);
+                        await _undoManager.SaveSessionAsync(_lastSession);
+                    }
+                }
+            }
+            else
+            {
+                // No rename needed, just metadata
+                _appliedChanges.Add(new AppliedChangeRecord
+                {
+                    OriginalFilename = Path.GetFileName(result.OriginalPath),
+                    NewFilename = Path.GetFileName(result.OriginalPath),
+                    OriginalPath = result.OriginalPath,
+                    NewPath = result.OriginalPath,
+                    WasRenamed = false,
+                    MetadataWritten = metadataSuccess,
+                    AppliedAt = DateTime.Now,
+                    SessionId = _currentSessionId
+                });
+            }
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"Real-time auto-apply failed for {result.OriginalFilename}: {ex.Message}");
+        }
+    }
+
+    private void ShowAutoApplyHistory()
+    {
+        // Show history view after real-time auto-apply
+        EmptyState.Visibility = Visibility.Collapsed;
+        ProgressState.Visibility = Visibility.Collapsed;
+        ResultsState.Visibility = Visibility.Collapsed;
+        HistoryState.Visibility = Visibility.Visible;
+
+        var renamedCount = _appliedChanges.Count(c => c.WasRenamed);
+        var metadataOnlyCount = _appliedChanges.Count(c => !c.WasRenamed);
+
+        HistorySummary.Text = $"{_appliedChanges.Count} changes applied: {renamedCount} renamed, {_appliedChanges.Count} metadata written";
+        StatusText.Text = $"Auto-applied: {renamedCount} renamed, {metadataOnlyCount} metadata-only";
+        UndoButton.IsEnabled = renamedCount > 0;
+
+        // Show summary message
+        var summaryMessage = $"Auto-apply completed:\n\n" +
+                           $"✓ {renamedCount} file(s) renamed\n" +
+                           $"✓ {_appliedChanges.Count} file(s) metadata written\n";
+
+        if (metadataOnlyCount > 0)
+        {
+            summaryMessage += $"\n{metadataOnlyCount} file(s) kept their original names (already correct or no change needed)";
+        }
+
+        summaryMessage += $"\n\nChanges were applied in real-time as each file was analyzed.\n\nYou can select and undo specific changes if needed.";
+
+        MessageBox.Show(summaryMessage, "Auto-Apply Complete", MessageBoxButton.OK, MessageBoxImage.Information);
+    }
+
+    private void AutoApplyCheckBox_Checked(object sender, RoutedEventArgs e)
+    {
+        var result = MessageBox.Show(
+            "Auto-apply mode will automatically rename files and write metadata as soon as the LLM returns results, WITHOUT asking for confirmation.\n\n" +
+            "⚠️ This will immediately change your files!\n\n" +
+            "You will be able to review and undo changes afterwards.\n\n" +
+            "Are you sure you want to enable auto-apply mode?",
+            "Enable Auto-Apply Mode",
+            MessageBoxButton.YesNo,
+            MessageBoxImage.Warning);
+
+        if (result != MessageBoxResult.Yes)
+        {
+            AutoApplyCheckBox.IsChecked = false;
+            return;
+        }
+
+        _autoApplyEnabled = true;
+        StatusText.Text = "Auto-apply mode enabled - changes will be applied automatically";
+    }
+
+    private void AutoApplyCheckBox_Unchecked(object sender, RoutedEventArgs e)
+    {
+        _autoApplyEnabled = false;
+        StatusText.Text = "Auto-apply mode disabled";
+    }
+
+    private async Task AutoApplyChangesAsync(List<ImageAnalysisResult> results)
+    {
+        _currentSessionId = Guid.NewGuid();
+        _appliedChanges.Clear();
+
+        var successfulResults = results.Where(r => r.Status == AnalysisStatus.Success).ToList();
+        if (successfulResults.Count == 0)
+        {
+            StatusText.Text = "Auto-apply: No successful results to apply";
+            return;
+        }
+
+        // CRITICAL FIX: Auto-approve all successful results
+        // PlanRenames only processes approved results, but in auto-apply mode
+        // we want to apply ALL successful results automatically
+        foreach (var result in successfulResults)
+        {
+            result.IsApproved = true;
+        }
+
+        StatusText.Text = "Auto-applying changes...";
+
+        try
+        {
+            var metadataWriter = new MetadataWriterService();
+            int metadataSuccessCount = 0;
+            int metadataFailCount = 0;
+
+            // Write metadata to ALL successful results
+            foreach (var result in successfulResults)
+            {
+                try
+                {
+                    var success = await metadataWriter.WriteMetadataAsync(result, result.OriginalPath, CancellationToken.None);
+                    if (success)
+                    {
+                        metadataSuccessCount++;
+                    }
+                    else
+                    {
+                        metadataFailCount++;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    metadataFailCount++;
+                    System.Diagnostics.Debug.WriteLine($"Metadata write failed for {result.OriginalPath}: {ex.Message}");
+                }
+            }
+
+            // Rename files that need it
+            var operations = _renamePlanner.PlanRenames(successfulResults);
+
+            if (operations.Count > 0)
+            {
+                var resultsByPath = successfulResults
+                    .GroupBy(r => r.OriginalPath, StringComparer.OrdinalIgnoreCase)
+                    .ToDictionary(g => g.Key, g => g.First(), StringComparer.OrdinalIgnoreCase);
+
+                StatusText.Text = $"Renaming {operations.Count} file(s)...";
+                var session = await _renamePlanner.ExecuteRenamesAsync(operations, resultsByPath, writeMetadata: false);
+                await _undoManager.SaveSessionAsync(session);
+                _lastSession = session;
+
+                // Record changes for history view
+                foreach (var op in session.Operations.Where(o => o.WasSuccessful))
+                {
+                    _appliedChanges.Add(new AppliedChangeRecord
+                    {
+                        OriginalFilename = Path.GetFileName(op.OriginalPath),
+                        NewFilename = Path.GetFileName(op.NewPath),
+                        OriginalPath = op.OriginalPath,
+                        NewPath = op.NewPath,
+                        WasRenamed = true,
+                        MetadataWritten = true,
+                        AppliedAt = DateTime.Now,
+                        SessionId = _currentSessionId
+                    });
+                }
+            }
+
+            // Record metadata-only changes (files that didn't need renaming)
+            var renamedPaths = operations.Select(o => o.OriginalPath).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            foreach (var result in successfulResults.Where(r => !renamedPaths.Contains(r.OriginalPath)))
+            {
+                _appliedChanges.Add(new AppliedChangeRecord
+                {
+                    OriginalFilename = Path.GetFileName(result.OriginalPath),
+                    NewFilename = Path.GetFileName(result.OriginalPath),
+                    OriginalPath = result.OriginalPath,
+                    NewPath = result.OriginalPath,
+                    WasRenamed = false,
+                    MetadataWritten = true,
+                    AppliedAt = DateTime.Now,
+                    SessionId = _currentSessionId
+                });
+            }
+
+            // Show history view
+            EmptyState.Visibility = Visibility.Collapsed;
+            ProgressState.Visibility = Visibility.Collapsed;
+            ResultsState.Visibility = Visibility.Collapsed;
+            HistoryState.Visibility = Visibility.Visible;
+
+            var renamedCount = _appliedChanges.Count(c => c.WasRenamed);
+            var metadataOnlyCount = _appliedChanges.Count(c => !c.WasRenamed);
+
+            HistorySummary.Text = $"{_appliedChanges.Count} changes applied: {renamedCount} renamed, {metadataSuccessCount} metadata written";
+            StatusText.Text = $"Auto-applied: {renamedCount} renamed, {metadataOnlyCount} metadata-only" +
+                             (metadataFailCount > 0 ? $" ({metadataFailCount} metadata failed)" : "");
+            UndoButton.IsEnabled = renamedCount > 0;
+
+            // Show summary message
+            var summaryMessage = $"Auto-apply completed:\n\n" +
+                               $"✓ {renamedCount} file(s) renamed\n" +
+                               $"✓ {metadataSuccessCount} file(s) metadata written\n";
+
+            if (metadataOnlyCount > 0)
+            {
+                summaryMessage += $"\n{metadataOnlyCount} file(s) kept their original names (already correct or no change needed)";
+            }
+
+            if (metadataFailCount > 0)
+            {
+                summaryMessage += $"\n\n⚠ {metadataFailCount} file(s) had metadata write errors";
+            }
+
+            summaryMessage += $"\n\nYou can select and undo specific changes if needed.";
+
+            MessageBox.Show(summaryMessage, "Auto-Apply Complete", MessageBoxButton.OK, MessageBoxImage.Information);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"Auto-apply failed: {ex.Message}", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
+            StatusText.Text = $"Auto-apply error: {ex.Message}";
+        }
+    }
+
+    private void SelectAllHistoryButton_Click(object sender, RoutedEventArgs e)
+    {
+        foreach (var change in _appliedChanges)
+        {
+            change.IsSelectedForUndo = true;
+        }
+        UpdateUndoSelectionText();
+        HistoryListView.Items.Refresh();
+    }
+
+    private void DeselectAllHistoryButton_Click(object sender, RoutedEventArgs e)
+    {
+        foreach (var change in _appliedChanges)
+        {
+            change.IsSelectedForUndo = false;
+        }
+        UpdateUndoSelectionText();
+        HistoryListView.Items.Refresh();
+    }
+
+    private void CloseHistoryButton_Click(object sender, RoutedEventArgs e)
+    {
+        HistoryState.Visibility = Visibility.Collapsed;
+        EmptyState.Visibility = Visibility.Visible;
+        _results.Clear();
+        _selectedPath = null;
+        AnalyzeButton.IsEnabled = false;
+        StatusText.Text = "Ready";
+    }
+
+    private void HistoryItem_CheckChanged(object sender, RoutedEventArgs e)
+    {
+        UpdateUndoSelectionText();
+    }
+
+    private void UpdateUndoSelectionText()
+    {
+        var selectedCount = _appliedChanges.Count(c => c.IsSelectedForUndo);
+        UndoSelectionText.Text = $"{selectedCount} item(s) selected";
+        UndoSelectedButton.IsEnabled = selectedCount > 0;
+    }
+
+    private void UndoSelectedButton_Click(object sender, RoutedEventArgs e)
+    {
+        var selectedChanges = _appliedChanges.Where(c => c.IsSelectedForUndo && c.WasRenamed).ToList();
+
+        if (selectedChanges.Count == 0)
+        {
+            MessageBox.Show("No renamed files selected for undo.\n\nNote: Only file renames can be undone. Metadata changes are permanent.",
+                "Nothing to Undo", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+
+        var confirm = MessageBox.Show(
+            $"This will undo {selectedChanges.Count} file rename(s).\n\nNote: Metadata changes cannot be undone.\n\nContinue?",
+            "Confirm Undo",
+            MessageBoxButton.YesNo,
+            MessageBoxImage.Question);
+
+        if (confirm != MessageBoxResult.Yes)
+        {
+            return;
+        }
+
+        UndoSelectedButton.IsEnabled = false;
+        StatusText.Text = "Undoing selected changes...";
+
+        try
+        {
+            int revertedCount = 0;
+
+            foreach (var change in selectedChanges)
+            {
+                try
+                {
+                    if (File.Exists(change.NewPath))
+                    {
+                        File.Move(change.NewPath, change.OriginalPath);
+                        revertedCount++;
+                        _appliedChanges.Remove(change);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"Failed to undo {change.NewPath}: {ex.Message}");
+                }
+            }
+
+            HistoryListView.Items.Refresh();
+            UpdateUndoSelectionText();
+
+            HistorySummary.Text = $"{_appliedChanges.Count} changes remaining";
+            StatusText.Text = $"Reverted {revertedCount} file(s)";
+
+            if (_appliedChanges.Count == 0)
+            {
+                CloseHistoryButton_Click(this, new RoutedEventArgs());
+            }
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"Failed to undo: {ex.Message}", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
+            UndoSelectedButton.IsEnabled = true;
+        }
     }
 }

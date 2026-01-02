@@ -184,14 +184,38 @@ public class LmStudioVisionService : IDisposable
                 _logger.Warning("Server error on attempt {Attempt}/{MaxRetries}: {Message}", attempt, _config.MaxRetries, ex.Message);
                 if (attempt < _config.MaxRetries)
                 {
-                    await Task.Delay(TimeSpan.FromSeconds(Math.Pow(2, attempt)), cancellationToken);
+                    var delaySeconds = Math.Pow(2, attempt);
+                    _logger.Debug("Retrying in {Delay} seconds...", delaySeconds);
+                    await Task.Delay(TimeSpan.FromSeconds(delaySeconds), cancellationToken);
                 }
             }
             catch (LmStudioApiException ex) when (ex.StatusCode >= 400 && ex.StatusCode < 500)
             {
-                // Client errors - don't retry
-                _logger.Error("Client error (no retry): {Message}", ex.Message);
-                throw;
+                // Check if this is a transient LM Studio image processing error that should be retried
+                bool isTransientImageError = ex.Message.Contains("Failed to get loaded image state") ||
+                                            ex.Message.Contains("calculate its token count") ||
+                                            ex.Message.Contains("image state for token");
+
+                if (isTransientImageError)
+                {
+                    // This is a known transient error from LM Studio - retry it
+                    lastException = ex;
+                    attempt++;
+                    _logger.Warning("LM Studio image processing error on attempt {Attempt}/{MaxRetries}: {Message}",
+                        attempt, _config.MaxRetries, ex.Message);
+                    if (attempt < _config.MaxRetries)
+                    {
+                        var delaySeconds = Math.Pow(2, attempt);
+                        _logger.Debug("Retrying in {Delay} seconds...", delaySeconds);
+                        await Task.Delay(TimeSpan.FromSeconds(delaySeconds), cancellationToken);
+                    }
+                }
+                else
+                {
+                    // Other client errors - don't retry
+                    _logger.Error("Client error (no retry): {Message}", ex.Message);
+                    throw;
+                }
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
@@ -201,7 +225,9 @@ public class LmStudioVisionService : IDisposable
                 _logger.Warning("Error on attempt {Attempt}/{MaxRetries}: {Message}", attempt, _config.MaxRetries, ex.Message);
                 if (attempt < _config.MaxRetries)
                 {
-                    await Task.Delay(TimeSpan.FromSeconds(Math.Pow(2, attempt)), cancellationToken);
+                    var delaySeconds = Math.Pow(2, attempt);
+                    _logger.Debug("Retrying in {Delay} seconds...", delaySeconds);
+                    await Task.Delay(TimeSpan.FromSeconds(delaySeconds), cancellationToken);
                 }
             }
         }
@@ -456,7 +482,8 @@ RULES:
 - copyright: ONLY fill if copyright notice is VISIBLE in image, otherwise empty string
 - visible_date: ONLY fill if a date is VISIBLE in the image (timestamp, text), otherwise empty string
 
-DO NOT GUESS authors, copyright, or visible_date. Only include if clearly visible in the image.
+- DO NOT GUESS authors, copyright, or visible_date. Only include if clearly visible in the image.
+- ALL VALUES MUST BE IN ENGLISH. Translate if necessary.
 Respond with ONLY the JSON object, no markdown, no explanation.";
     }
 

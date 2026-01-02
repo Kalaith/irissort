@@ -73,7 +73,12 @@ public class ImageAnalyzerService : IDisposable
 
             try
             {
+                // LM Studio has issues decoding certain PNG features (interlacing, 16-bit, ICC profiles),
+                // WebP, and GIF (animated). Always convert these to JPEG for maximum compatibility.
+                var isPng = fileInfo.Extension.Equals(".png", StringComparison.OrdinalIgnoreCase);
                 var isWebP = fileInfo.Extension.Equals(".webp", StringComparison.OrdinalIgnoreCase);
+                var isGif = fileInfo.Extension.Equals(".gif", StringComparison.OrdinalIgnoreCase);
+                bool needsConversion = isPng || isWebP || isGif;
 
                 var maxDimension = _visionService.Configuration.MaxImageDimension;
                 bool needsResizing = false;
@@ -97,13 +102,14 @@ public class ImageAnalyzerService : IDisposable
                     }
                 }
 
-                if (needsResizing || isWebP)
+                if (needsResizing || needsConversion)
                 {
                     // Create resized/converted copy for analysis
-                    // ImageResizerService automatically converts WebP to JPEG
+                    // ImageResizerService automatically converts PNG/WebP/GIF to JPEG for LM Studio compatibility
+                    // For GIFs, only the first frame is extracted
                     tempResizedPath = await _imageResizer.CreateResizedCopyAsync(filePath, maxDimension, cancellationToken);
                     imageData = await File.ReadAllBytesAsync(tempResizedPath, cancellationToken);
-                    mimeType = FolderScannerService.GetMimeType(tempResizedPath); // Will be image/jpeg for converted WebP
+                    mimeType = FolderScannerService.GetMimeType(tempResizedPath); // Will be image/jpeg for converted images
                 }
                 else
                 {
@@ -165,9 +171,11 @@ public class ImageAnalyzerService : IDisposable
     /// Analyzes multiple images with progress reporting.
     /// Returns partial results if cancelled or if individual images fail.
     /// </summary>
+    /// <param name="onResultCallback">Optional callback invoked after each successful analysis. Useful for auto-apply scenarios.</param>
     public async Task<List<ImageAnalysisResult>> AnalyzeBatchAsync(
         IEnumerable<string> filePaths,
         IProgress<(int current, int total, string fileName)>? progress = null,
+        Func<ImageAnalysisResult, Task>? onResultCallback = null,
         CancellationToken cancellationToken = default)
     {
         var files = filePaths.ToList();
@@ -191,6 +199,12 @@ public class ImageAnalyzerService : IDisposable
             {
                 var result = await AnalyzeImageAsync(filePath, cancellationToken);
                 results.Add(result);
+
+                // Invoke callback if provided (for auto-apply scenarios)
+                if (onResultCallback != null && result.Status == AnalysisStatus.Success)
+                {
+                    await onResultCallback(result);
+                }
             }
             catch (OperationCanceledException)
             {
@@ -219,14 +233,16 @@ public class ImageAnalyzerService : IDisposable
     /// <summary>
     /// Analyzes all images in a directory.
     /// </summary>
+    /// <param name="onResultCallback">Optional callback invoked after each successful analysis. Useful for auto-apply scenarios.</param>
     public async Task<List<ImageAnalysisResult>> AnalyzeDirectoryAsync(
         string directoryPath,
         bool recursive = false,
         IProgress<(int current, int total, string fileName)>? progress = null,
+        Func<ImageAnalysisResult, Task>? onResultCallback = null,
         CancellationToken cancellationToken = default)
     {
         var files = await _folderScanner.ScanDirectoryAsync(directoryPath, recursive, cancellationToken);
-        return await AnalyzeBatchAsync(files, progress, cancellationToken);
+        return await AnalyzeBatchAsync(files, progress, onResultCallback, cancellationToken);
     }
 
     /// <summary>

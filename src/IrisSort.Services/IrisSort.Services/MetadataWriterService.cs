@@ -13,11 +13,13 @@ public class MetadataWriterService
 {
     private readonly ILogger _logger;
     private readonly PngWebpMetadataWriter _pngWebpWriter;
+    private readonly JpegXmpMetadataWriter _jpegXmpWriter;
 
     public MetadataWriterService(ILogger? logger = null)
     {
         _logger = logger ?? LoggerFactory.CreateLogger<MetadataWriterService>();
         _pngWebpWriter = new PngWebpMetadataWriter(logger);
+        _jpegXmpWriter = new JpegXmpMetadataWriter(logger);
     }
 
     /// <summary>
@@ -42,6 +44,19 @@ public class MetadataWriterService
         {
             _logger.Information("Using specialized PNG/WEBP XMP writer for {Extension}", extension);
             return await _pngWebpWriter.WriteMetadataAsync(result, targetPath, cancellationToken);
+        }
+
+        // Use specialized XMP writer for JPEG files to ensure proper UTF-8 encoding
+        if (extension == ".jpg" || extension == ".jpeg")
+        {
+            _logger.Information("Using specialized JPEG XMP writer for {Extension}", extension);
+            return await _jpegXmpWriter.WriteMetadataAsync(result, targetPath, cancellationToken);
+        }
+
+        // GIF files have limited metadata support - warn user
+        if (extension == ".gif")
+        {
+            _logger.Warning("GIF metadata support is limited - metadata may not persist or be readable by all applications");
         }
 
         return await Task.Run(() =>

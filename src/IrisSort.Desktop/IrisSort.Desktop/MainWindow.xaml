@@ -93,13 +93,21 @@
                     
                     <!-- Action Buttons -->
                     <StackPanel Grid.Column="1" Orientation="Horizontal">
-                        <Button x:Name="SelectFolderButton" Content="📁 Select Folder" 
+                        <CheckBox x:Name="AutoApplyCheckBox"
+                                  Content="Auto-apply changes"
+                                  VerticalAlignment="Center"
+                                  Foreground="{StaticResource TextBrush}"
+                                  Margin="0,0,16,0"
+                                  Checked="AutoApplyCheckBox_Checked"
+                                  Unchecked="AutoApplyCheckBox_Unchecked"
+                                  ToolTip="Automatically apply changes as soon as the LLM returns results (no confirmation)"/>
+                        <Button x:Name="SelectFolderButton" Content="📁 Select Folder"
                                 Style="{StaticResource SecondaryButton}" Margin="0,0,8,0"
                                 Click="SelectFolderButton_Click"/>
-                        <Button x:Name="SelectFileButton" Content="🖼️ Select Image" 
+                        <Button x:Name="SelectFileButton" Content="🖼️ Select Image"
                                 Style="{StaticResource SecondaryButton}" Margin="0,0,8,0"
                                 Click="SelectFileButton_Click"/>
-                        <Button x:Name="AnalyzeButton" Content="✨ Analyze" 
+                        <Button x:Name="AnalyzeButton" Content="✨ Analyze"
                                 Style="{StaticResource PrimaryButton}" IsEnabled="False"
                                 Click="AnalyzeButton_Click"/>
                     </StackPanel>
@@ -204,13 +212,98 @@
                         <!-- Apply Actions -->
                         <Border Grid.Row="2" Background="#252535" Padding="16">
                             <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
-                                <Button x:Name="UndoButton" Content="↩ Undo Last" 
+                                <Button x:Name="UndoButton" Content="↩ Undo Last"
                                         Style="{StaticResource SecondaryButton}" Margin="0,0,8,0"
                                         IsEnabled="False" Click="UndoButton_Click"/>
                                 <Button x:Name="ApplyButton" Content="🚀 Apply Changes"
                                         Style="{StaticResource PrimaryButton}"
                                         IsEnabled="False"
                                         Click="ApplyButton_Click"/>
+                            </StackPanel>
+                        </Border>
+                    </Grid>
+
+                    <!-- History State (Applied Changes) -->
+                    <Grid x:Name="HistoryState" Visibility="Collapsed">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="*"/>
+                            <RowDefinition Height="Auto"/>
+                        </Grid.RowDefinitions>
+
+                        <!-- History Header -->
+                        <Border Grid.Row="0" Background="#252535" Padding="16">
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
+                                <TextBlock x:Name="HistorySummary" Text="0 changes applied"
+                                           FontSize="14" Foreground="{StaticResource TextBrush}"/>
+                                <StackPanel Grid.Column="1" Orientation="Horizontal">
+                                    <Button x:Name="SelectAllHistoryButton" Content="Select All"
+                                            Style="{StaticResource SecondaryButton}" Margin="0,0,8,0"
+                                            Click="SelectAllHistoryButton_Click"/>
+                                    <Button x:Name="DeselectAllHistoryButton" Content="Deselect All"
+                                            Style="{StaticResource SecondaryButton}" Margin="0,0,8,0"
+                                            Click="DeselectAllHistoryButton_Click"/>
+                                    <Button x:Name="CloseHistoryButton" Content="✓ Done"
+                                            Style="{StaticResource PrimaryButton}"
+                                            Click="CloseHistoryButton_Click"/>
+                                </StackPanel>
+                            </Grid>
+                        </Border>
+
+                        <!-- History List -->
+                        <ListView x:Name="HistoryListView" Grid.Row="1"
+                                  Background="Transparent" BorderThickness="0"
+                                  Foreground="{StaticResource TextBrush}">
+                            <ListView.View>
+                                <GridView>
+                                    <GridViewColumn Header="✓" Width="35">
+                                        <GridViewColumn.CellTemplate>
+                                            <DataTemplate>
+                                                <CheckBox IsChecked="{Binding IsSelectedForUndo}"
+                                                          VerticalAlignment="Center"
+                                                          Checked="HistoryItem_CheckChanged"
+                                                          Unchecked="HistoryItem_CheckChanged"/>
+                                            </DataTemplate>
+                                        </GridViewColumn.CellTemplate>
+                                    </GridViewColumn>
+                                    <GridViewColumn Header="Original Name" Width="200"
+                                                    DisplayMemberBinding="{Binding OriginalFilename}"/>
+                                    <GridViewColumn Header="→" Width="30">
+                                        <GridViewColumn.CellTemplate>
+                                            <DataTemplate>
+                                                <TextBlock Text="→" HorizontalAlignment="Center" Foreground="{StaticResource TextSecondaryBrush}"/>
+                                            </DataTemplate>
+                                        </GridViewColumn.CellTemplate>
+                                    </GridViewColumn>
+                                    <GridViewColumn Header="New Name" Width="200"
+                                                    DisplayMemberBinding="{Binding NewFilename}"/>
+                                    <GridViewColumn Header="Type" Width="120">
+                                        <GridViewColumn.CellTemplate>
+                                            <DataTemplate>
+                                                <TextBlock Text="{Binding ChangeTypeDisplay}"/>
+                                            </DataTemplate>
+                                        </GridViewColumn.CellTemplate>
+                                    </GridViewColumn>
+                                    <GridViewColumn Header="Applied At" Width="140"
+                                                    DisplayMemberBinding="{Binding AppliedAt, StringFormat='yyyy-MM-dd HH:mm:ss'}"/>
+                                </GridView>
+                            </ListView.View>
+                        </ListView>
+
+                        <!-- Undo Actions -->
+                        <Border Grid.Row="2" Background="#252535" Padding="16">
+                            <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                                <TextBlock x:Name="UndoSelectionText" Text="0 items selected"
+                                           VerticalAlignment="Center" Margin="0,0,16,0"
+                                           Foreground="{StaticResource TextSecondaryBrush}"/>
+                                <Button x:Name="UndoSelectedButton" Content="↩ Undo Selected"
+                                        Style="{StaticResource PrimaryButton}"
+                                        IsEnabled="False"
+                                        Click="UndoSelectedButton_Click"/>
                             </StackPanel>
                         </Border>
                     </Grid>
