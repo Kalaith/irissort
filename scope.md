@@ -2,6 +2,8 @@
 
 Local AI-assisted image renaming & tagging tool
 
+> Implementation note (fresh review): the current app uses LM Studio's local OpenAI-compatible vision API, not the original Gemini/API-key design described in some historical sections below. Folder scanning, recursive scanning, and existing-tag skipping work without LM Studio; only AI analysis requires the local server.
+
 ## 1. Purpose & Goals
 
 IrisSort scans a user-selected folder of images, analyzes each image using an LLM vision model (Gemini initially), and suggests improved filenames and metadata tags based on image contents.

@@ -59,11 +59,12 @@ public class ImageAnalyzerService : IDisposable
             result.FileHash = await FolderScannerService.CalculateFileHashAsync(filePath, cancellationToken);
 
             // Check cache
-            if (_cache.TryGetValue(result.FileHash, out var cached))
+            // Include the model and original name because both can affect the prompt/result.
+            // Returning a clone prevents duplicate files from sharing mutable UI state.
+            var cacheKey = $"{_visionService.Configuration.Model}\n{result.OriginalFilename}\n{result.FileHash}";
+            if (_cache.TryGetValue(cacheKey, out var cached))
             {
-                cached.OriginalPath = filePath;
-                cached.OriginalFilename = fileInfo.Name;
-                return cached;
+                return CloneResult(cached, filePath, fileInfo);
             }
 
             // Check if image needs resizing due to size limits OR if it's WebP (needs conversion)
@@ -135,7 +136,7 @@ public class ImageAnalyzerService : IDisposable
                 result.AnalyzedAt = DateTime.Now;
 
                 // Cache result (thread-safe)
-                _cache.AddOrUpdate(result.FileHash, result, (key, old) => result);
+                _cache.AddOrUpdate(cacheKey, CloneResult(result, filePath, fileInfo), (_, _) => CloneResult(result, filePath, fileInfo));
 
                 return result;
             }
@@ -251,6 +252,36 @@ public class ImageAnalyzerService : IDisposable
     public void ClearCache()
     {
         _cache.Clear();
+    }
+
+    private static ImageAnalysisResult CloneResult(
+        ImageAnalysisResult source,
+        string filePath,
+        FileInfo fileInfo)
+    {
+        return new ImageAnalysisResult
+        {
+            OriginalPath = filePath,
+            OriginalFilename = fileInfo.Name,
+            SuggestedFilename = source.SuggestedFilename,
+            Tags = source.Tags.ToList(),
+            Description = source.Description,
+            Title = source.Title,
+            Subject = source.Subject,
+            Comments = source.Comments,
+            Authors = source.Authors,
+            Copyright = source.Copyright,
+            VisibleDate = source.VisibleDate,
+            Status = source.Status,
+            ErrorMessage = source.ErrorMessage,
+            FileHash = source.FileHash,
+            AnalyzedAt = source.AnalyzedAt,
+            FileSizeBytes = fileInfo.Length,
+            Extension = fileInfo.Extension.ToLowerInvariant(),
+            IsApproved = false,
+            EditedFilename = null,
+            EditedTags = null
+        };
     }
 
     /// <summary>

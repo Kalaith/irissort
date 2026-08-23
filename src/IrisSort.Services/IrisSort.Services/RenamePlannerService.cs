@@ -27,11 +27,11 @@ public class RenamePlannerService
         foreach (var result in results.Where(r => r.IsApproved && r.Status == AnalysisStatus.Success))
         {
             var directory = Path.GetDirectoryName(result.OriginalPath) ?? ".";
-            var newFilename = result.FinalFilename;
+            var baseName = FilenameSanitizer.Sanitize(result.FinalFilename);
+            var newFilename = baseName;
             var extension = result.Extension;
 
             // Resolve collisions
-            var baseName = newFilename;
             var counter = 1;
             var fullNewName = $"{newFilename}{extension}";
             var potentialPath = Path.Combine(directory, fullNewName);

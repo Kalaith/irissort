@@ -2,8 +2,8 @@ namespace IrisSort.Core.Models;
 
 /// <summary>
 /// User-configurable processing options.
-/// NOTE: This class is currently planned for future use. Most options are not yet implemented in the UI.
-/// Some functionality (RecursiveScan, WriteMetadata) is currently hard-coded in the application.
+/// Folder-processing preferences are persisted by the desktop application.
+/// Metadata writing remains enabled for approved changes; it is intentionally not an automatic default.
 /// </summary>
 public class ProcessingOptions
 {

@@ -1,4 +1,5 @@
 using System.Text.Json;
+using IrisSort.Core.Models;
 
 namespace IrisSort.Services.Configuration;
 
@@ -53,6 +54,12 @@ public class ConfigurationService
         /// Maximum retry attempts.
         /// </summary>
         public int MaxRetries { get; set; } = 3;
+
+        /// <summary>Whether folder scans include subdirectories.</summary>
+        public bool RecursiveScan { get; set; }
+
+        /// <summary>Whether files that already contain keywords are skipped.</summary>
+        public bool SkipExistingTags { get; set; }
     }
 
     /// <summary>
@@ -131,6 +138,28 @@ public class ConfigurationService
             MaxRetries = config.MaxRetries,
             MaxImageDimension = config.MaxImageDimension
         };
+    }
+
+    /// <summary>
+    /// Copies persisted processing settings to the domain options.
+    /// </summary>
+    public static void ApplyToProcessingOptions(IrisSortConfig source, ProcessingOptions target)
+    {
+        target.RecursiveScan = source.RecursiveScan;
+        target.SkipExistingTags = source.SkipExistingTags;
+    }
+
+    /// <summary>
+    /// Creates persisted settings from the current processing options.
+    /// </summary>
+    public static IrisSortConfig CreateFromProcessingOptions(
+        ProcessingOptions options,
+        IrisSortConfig? existing = null)
+    {
+        var config = existing ?? new IrisSortConfig();
+        config.RecursiveScan = options.RecursiveScan;
+        config.SkipExistingTags = options.SkipExistingTags;
+        return config;
     }
 
     /// <summary>

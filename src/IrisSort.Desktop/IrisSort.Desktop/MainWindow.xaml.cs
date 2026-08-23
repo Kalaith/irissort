@@ -48,6 +48,10 @@ public class ResultViewModel : INotifyPropertyChanged
             {
                 return "Ready";
             }
+            else if (_result.Status == AnalysisStatus.Skipped)
+            {
+                return "Skipped (tagged)";
+            }
             return _result.Status.ToString();
         }
     }
@@ -87,11 +91,14 @@ public class ResultViewModel : INotifyPropertyChanged
 public partial class MainWindow : Window
 {
     private readonly LmStudioConfiguration _config;
+    private readonly ConfigurationService.IrisSortConfig _savedConfig;
+    private readonly ProcessingOptions _processingOptions;
     private readonly LmStudioVisionService _visionService;
     private readonly ImageAnalyzerService _analyzerService;
     private readonly FolderScannerService _folderScanner;
     private readonly RenamePlannerService _renamePlanner;
     private readonly UndoManagerService _undoManager;
+    private readonly MetadataWriterService _metadataWriter;
 
     private CancellationTokenSource? _cancellationTokenSource;
     private string? _selectedPath;
@@ -101,15 +108,18 @@ public partial class MainWindow : Window
     private bool _autoApplyEnabled;
     private readonly ObservableCollection<AppliedChangeRecord> _appliedChanges = new();
     private Guid _currentSessionId;
+    private bool _isInitializingSettings;
 
     public MainWindow()
     {
         InitializeComponent();
 
         // Load persisted configuration
-        var savedConfig = ConfigurationService.LoadConfiguration();
+        _savedConfig = ConfigurationService.LoadConfiguration();
         _config = new LmStudioConfiguration();
-        ConfigurationService.ApplyToLmStudioConfiguration(savedConfig, _config);
+        ConfigurationService.ApplyToLmStudioConfiguration(_savedConfig, _config);
+        _processingOptions = new ProcessingOptions();
+        ConfigurationService.ApplyToProcessingOptions(_savedConfig, _processingOptions);
 
         // Initialize services
         _visionService = new LmStudioVisionService(_config);
@@ -117,9 +127,15 @@ public partial class MainWindow : Window
         _folderScanner = new FolderScannerService();
         _renamePlanner = new RenamePlannerService();
         _undoManager = new UndoManagerService();
+        _metadataWriter = new MetadataWriterService();
 
         // Set DataContext for binding
         DataContext = this;
+
+        _isInitializingSettings = true;
+        RecursiveScanCheckBox.IsChecked = _processingOptions.RecursiveScan;
+        SkipExistingTagsCheckBox.IsChecked = _processingOptions.SkipExistingTags;
+        _isInitializingSettings = false;
 
         // Bind results list
         ResultsListView.ItemsSource = _results;
@@ -165,8 +181,7 @@ public partial class MainWindow : Window
                 // Save configuration
                 try
                 {
-                    var configToSave = ConfigurationService.CreateFromLmStudioConfiguration(_config);
-                    ConfigurationService.SaveConfiguration(configToSave);
+                    SaveConfiguration();
                     StatusText.Text = $"Max dimension updated to {newDim}px";
                 }
                 catch (Exception ex)
@@ -182,6 +197,34 @@ public partial class MainWindow : Window
             // Invalid input, revert
             MaxDimTextBox.Text = _config.MaxImageDimension.ToString();
         }
+    }
+
+    private void ProcessingOptions_Changed(object sender, RoutedEventArgs e)
+    {
+        if (_isInitializingSettings)
+        {
+            return;
+        }
+
+        _processingOptions.RecursiveScan = RecursiveScanCheckBox.IsChecked == true;
+        _processingOptions.SkipExistingTags = SkipExistingTagsCheckBox.IsChecked == true;
+
+        try
+        {
+            SaveConfiguration();
+            StatusText.Text = "Processing options saved. Re-select a folder to refresh its preview.";
+        }
+        catch (Exception ex)
+        {
+            StatusText.Text = $"Failed to save processing options: {ex.Message}";
+        }
+    }
+
+    private void SaveConfiguration()
+    {
+        var configToSave = ConfigurationService.CreateFromLmStudioConfiguration(_config);
+        ConfigurationService.CreateFromProcessingOptions(_processingOptions, configToSave);
+        ConfigurationService.SaveConfiguration(configToSave);
     }
 
     private async Task CheckConnectionAsync()
@@ -205,7 +248,7 @@ public partial class MainWindow : Window
         {
             ConnectionStatus.Text = "LM Studio: Not Connected";
             ConnectionIndicator.Fill = (SolidColorBrush)FindResource("ErrorBrush");
-            StatusText.Text = "Warning: Start LM Studio and load a vision model";
+            StatusText.Text = "LM Studio offline — folder scanning and review are still available";
             ModelComboBox.Items.Clear();
             ModelComboBox.IsEnabled = false;
         }
@@ -283,8 +326,7 @@ public partial class MainWindow : Window
         // Save configuration to disk
         try
         {
-            var configToSave = ConfigurationService.CreateFromLmStudioConfiguration(_config);
-            ConfigurationService.SaveConfiguration(configToSave);
+            SaveConfiguration();
             StatusText.Text = $"Model changed to: {selectedModel}";
         }
         catch (Exception ex)
@@ -338,7 +380,10 @@ public partial class MainWindow : Window
             _results.Clear();
 
             // Scan directory for image files
-            var files = await _folderScanner.ScanDirectoryAsync(folderPath, recursive: false);
+            var files = await _folderScanner.ScanDirectoryAsync(folderPath, _processingOptions.RecursiveScan);
+            var taggedFiles = _processingOptions.SkipExistingTags
+                ? await FindExistingTaggedFilesAsync(files)
+                : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
             if (files.Count == 0)
             {
@@ -359,7 +404,10 @@ public partial class MainWindow : Window
                     OriginalFilename = fileInfo.Name,
                     Extension = fileInfo.Extension.ToLowerInvariant(),
                     FileSizeBytes = fileInfo.Length,
-                    Status = AnalysisStatus.Pending,
+                    Status = taggedFiles.Contains(filePath) ? AnalysisStatus.Skipped : AnalysisStatus.Pending,
+                    ErrorMessage = taggedFiles.Contains(filePath)
+                        ? "Skipped because keyword metadata already exists"
+                        : null,
                     SuggestedFilename = "" // Empty until analyzed
                 };
 
@@ -371,9 +419,13 @@ public partial class MainWindow : Window
             // Show results state
             EmptyState.Visibility = Visibility.Collapsed;
             ResultsState.Visibility = Visibility.Visible;
-            ResultsSummary.Text = $"{files.Count} images found - ready to analyze";
-            StatusText.Text = $"Found {files.Count} images. Click 'Analyze' to generate metadata.";
-            AnalyzeButton.IsEnabled = true;
+            var skippedCount = taggedFiles.Count;
+            ResultsSummary.Text = $"{files.Count} images found" +
+                                  (skippedCount > 0 ? $", {skippedCount} tagged skipped" : "");
+            StatusText.Text = skippedCount > 0
+                ? $"Found {files.Count} images. {skippedCount} already tagged and will be skipped."
+                : $"Found {files.Count} images. Click 'Analyze' to generate metadata.";
+            AnalyzeButton.IsEnabled = files.Count > skippedCount;
             ApplyButton.IsEnabled = false; // Disable until analysis is done
         }
         catch (Exception ex)
@@ -383,7 +435,42 @@ public partial class MainWindow : Window
         }
     }
 
-    private void SelectFileButton_Click(object sender, RoutedEventArgs e)
+    private Task<HashSet<string>> FindExistingTaggedFilesAsync(
+        IEnumerable<string> files,
+        CancellationToken cancellationToken = default)
+    {
+        var fileList = files.ToList();
+        return Task.Run(() =>
+        {
+            var taggedFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var file in fileList)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (_metadataWriter.HasExistingTags(file))
+                {
+                    taggedFiles.Add(file);
+                }
+            }
+
+            return taggedFiles;
+        }, cancellationToken);
+    }
+
+    private static ImageAnalysisResult CreateSkippedResult(string filePath)
+    {
+        var fileInfo = new FileInfo(filePath);
+        return new ImageAnalysisResult
+        {
+            OriginalPath = filePath,
+            OriginalFilename = fileInfo.Name,
+            Extension = fileInfo.Extension.ToLowerInvariant(),
+            FileSizeBytes = fileInfo.Length,
+            Status = AnalysisStatus.Skipped,
+            ErrorMessage = "Skipped because keyword metadata already exists"
+        };
+    }
+
+    private async void SelectFileButton_Click(object sender, RoutedEventArgs e)
     {
         var dialog = new OpenFileDialog
         {
@@ -401,13 +488,18 @@ public partial class MainWindow : Window
             _results.Clear();
 
             var fileInfo = new FileInfo(_selectedPath);
+            var isSkipped = _processingOptions.SkipExistingTags &&
+                            await Task.Run(() => _metadataWriter.HasExistingTags(_selectedPath));
             var pendingResult = new ImageAnalysisResult
             {
                 OriginalPath = _selectedPath,
                 OriginalFilename = fileInfo.Name,
                 Extension = fileInfo.Extension.ToLowerInvariant(),
                 FileSizeBytes = fileInfo.Length,
-                Status = AnalysisStatus.Pending,
+                Status = isSkipped ? AnalysisStatus.Skipped : AnalysisStatus.Pending,
+                ErrorMessage = isSkipped
+                    ? "Skipped because keyword metadata already exists"
+                    : null,
                 SuggestedFilename = "" // Empty until analyzed
             };
 
@@ -418,9 +510,13 @@ public partial class MainWindow : Window
             // Show results state
             EmptyState.Visibility = Visibility.Collapsed;
             ResultsState.Visibility = Visibility.Visible;
-            ResultsSummary.Text = "1 image selected - ready to analyze";
-            StatusText.Text = $"Selected file: {Path.GetFileName(_selectedPath)}. Click 'Analyze' to generate metadata.";
-            AnalyzeButton.IsEnabled = true;
+            ResultsSummary.Text = isSkipped
+                ? "1 image selected - already tagged"
+                : "1 image selected - ready to analyze";
+            StatusText.Text = isSkipped
+                ? $"Skipped {Path.GetFileName(_selectedPath)} because keyword metadata already exists."
+                : $"Selected file: {Path.GetFileName(_selectedPath)}. Click 'Analyze' to generate metadata.";
+            AnalyzeButton.IsEnabled = !isSkipped;
             ApplyButton.IsEnabled = false; // Disable until analysis is done
         }
     }
@@ -429,6 +525,12 @@ public partial class MainWindow : Window
     {
         if (string.IsNullOrEmpty(_selectedPath))
         {
+            return;
+        }
+
+        if (_results.Count > 0 && _results.All(r => r.Result.Status == AnalysisStatus.Skipped))
+        {
+            StatusText.Text = "Nothing to analyze — all selected images were skipped because they are already tagged.";
             return;
         }
 
@@ -501,12 +603,39 @@ public partial class MainWindow : Window
                         callback = ApplySingleResultAsync;
                     }
 
-                    results = await _analyzerService.AnalyzeDirectoryAsync(
+                    var files = await _folderScanner.ScanDirectoryAsync(
                         _selectedPath,
-                        recursive: false,
-                        progress,
-                        callback,
+                        _processingOptions.RecursiveScan,
                         _cancellationTokenSource.Token);
+                    var taggedFiles = _processingOptions.SkipExistingTags
+                        ? await FindExistingTaggedFilesAsync(files, _cancellationTokenSource.Token)
+                        : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                    foreach (var vm in _results)
+                    {
+                        if (taggedFiles.Contains(vm.Result.OriginalPath))
+                        {
+                            vm.Result.Status = AnalysisStatus.Skipped;
+                            vm.Result.ErrorMessage = "Skipped because keyword metadata already exists";
+                            vm.OnPropertyChanged(nameof(vm.StatusDisplay));
+                        }
+                    }
+
+                    results = files
+                        .Where(taggedFiles.Contains)
+                        .Select(CreateSkippedResult)
+                        .ToList();
+
+                    var filesToAnalyze = files.Where(path => !taggedFiles.Contains(path)).ToList();
+                    if (filesToAnalyze.Count > 0)
+                    {
+                        var analyzedResults = await _analyzerService.AnalyzeBatchAsync(
+                            filesToAnalyze,
+                            progress,
+                            callback,
+                            _cancellationTokenSource.Token);
+                        results.AddRange(analyzedResults);
+                    }
                 }
             }
             catch (OperationCanceledException)
@@ -600,6 +729,7 @@ public partial class MainWindow : Window
             // Update summary
             var successCount = results.Count(r => r.Status == AnalysisStatus.Success);
             var failedCount = results.Count(r => r.Status == AnalysisStatus.Failed);
+            var skippedCount = results.Count(r => r.Status == AnalysisStatus.Skipped);
             var pendingCount = _results.Count(r => r.Result.Status == AnalysisStatus.Pending);
 
             if (wasCancelled)
@@ -611,7 +741,8 @@ public partial class MainWindow : Window
             else
             {
                 ResultsSummary.Text = $"{successCount} images analyzed" +
-                                      (failedCount > 0 ? $", {failedCount} failed" : "");
+                                       (failedCount > 0 ? $", {failedCount} failed" : "") +
+                                       (skippedCount > 0 ? $", {skippedCount} skipped" : "");
             }
 
             // Switch to results state
@@ -634,11 +765,17 @@ public partial class MainWindow : Window
                 {
                     firstError = firstError.Substring(0, Constants.MaxErrorMessageStatusLength) + "...";
                 }
-                StatusText.Text = $"Analysis complete: {successCount} ok, {failedCount} failed. Last error: {firstError}";
+                StatusText.Text = $"Analysis complete: {successCount} ok, {failedCount} failed" +
+                                  (skippedCount > 0 ? $", {skippedCount} skipped" : "") +
+                                  $". Last error: {firstError}";
             }
             else
             {
                 StatusText.Text = $"Analysis complete: {successCount} images processed";
+                if (skippedCount > 0)
+                {
+                    StatusText.Text += $", {skippedCount} skipped";
+                }
             }
         }
         else if (wasCancelled)

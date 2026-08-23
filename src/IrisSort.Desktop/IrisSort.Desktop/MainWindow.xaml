@@ -101,6 +101,22 @@
                                   Checked="AutoApplyCheckBox_Checked"
                                   Unchecked="AutoApplyCheckBox_Unchecked"
                                   ToolTip="Automatically apply changes as soon as the LLM returns results (no confirmation)"/>
+                        <CheckBox x:Name="RecursiveScanCheckBox"
+                                  Content="Include subfolders"
+                                  VerticalAlignment="Center"
+                                  Foreground="{StaticResource TextBrush}"
+                                  Margin="0,0,12,0"
+                                  Checked="ProcessingOptions_Changed"
+                                  Unchecked="ProcessingOptions_Changed"
+                                  ToolTip="Scan supported images in all subfolders"/>
+                        <CheckBox x:Name="SkipExistingTagsCheckBox"
+                                  Content="Skip tagged"
+                                  VerticalAlignment="Center"
+                                  Foreground="{StaticResource TextBrush}"
+                                  Margin="0,0,12,0"
+                                  Checked="ProcessingOptions_Changed"
+                                  Unchecked="ProcessingOptions_Changed"
+                                  ToolTip="Do not send images that already have keyword metadata to LM Studio"/>
                         <Button x:Name="SelectFolderButton" Content="📁 Select Folder"
                                 Style="{StaticResource SecondaryButton}" Margin="0,0,8,0"
                                 Click="SelectFolderButton_Click"/>

@@ -1,5 +1,7 @@
 # IrisSort Implementation Plan
 
+> This is a historical planning document. The current implementation uses LM Studio's local vision API and now includes persisted recursive scanning and existing-tag skipping; the older Gemini references below are not the active integration.
+
 ## Overview
 
 This implementation plan outlines the development of IrisSort MVP - a local AI-assisted image renaming and tagging tool for Windows, modeled after the Howl project structure.

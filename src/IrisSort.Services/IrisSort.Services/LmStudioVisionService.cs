@@ -1,6 +1,5 @@
 using System.Text;
 using System.Text.Json;
-using System.Text.RegularExpressions;
 using IrisSort.Services.Configuration;
 using IrisSort.Services.Exceptions;
 using IrisSort.Services.Logging;
@@ -41,7 +40,7 @@ public class LmStudioVisionService : IDisposable
     {
         try
         {
-            var response = await _httpClient.GetAsync(_config.ModelsEndpoint, cancellationToken);
+            using var response = await _httpClient.GetAsync(_config.ModelsEndpoint, cancellationToken);
             return response.IsSuccessStatusCode;
         }
         catch
@@ -57,7 +56,7 @@ public class LmStudioVisionService : IDisposable
     {
         try
         {
-            var response = await _httpClient.GetAsync(_config.ModelsEndpoint, cancellationToken);
+            using var response = await _httpClient.GetAsync(_config.ModelsEndpoint, cancellationToken);
             if (!response.IsSuccessStatusCode)
             {
                 return Array.Empty<string>();
@@ -141,6 +140,10 @@ public class LmStudioVisionService : IDisposable
         {
             _logger.Error(ex, "HTTP error communicating with LM Studio");
             throw new LmStudioApiException($"Failed to communicate with LM Studio: {ex.Message}", ex);
+        }
+        catch (TaskCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
         }
         catch (TaskCanceledException ex)
         {
@@ -287,7 +290,20 @@ public class LmStudioVisionService : IDisposable
             }
 
             // Sanitize the filename
-            analysisResponse.SuggestedFilename = SanitizeFilename(analysisResponse.SuggestedFilename);
+            analysisResponse.SuggestedFilename = FilenameSanitizer.Sanitize(analysisResponse.SuggestedFilename);
+            analysisResponse.Tags = (analysisResponse.Tags ?? new List<string>())
+                .Where(tag => !string.IsNullOrWhiteSpace(tag))
+                .Select(tag => tag.Trim())
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .Take(20)
+                .ToList();
+            analysisResponse.Title ??= string.Empty;
+            analysisResponse.Subject ??= string.Empty;
+            analysisResponse.Description ??= string.Empty;
+            analysisResponse.Comments ??= string.Empty;
+            analysisResponse.Authors ??= string.Empty;
+            analysisResponse.Copyright ??= string.Empty;
+            analysisResponse.VisibleDate ??= string.Empty;
 
             _logger.Information("Parsed successfully - Filename: {Filename}, Title: {Title}, Tags: {Tags}",
                 analysisResponse.SuggestedFilename,
@@ -410,45 +426,6 @@ public class LmStudioVisionService : IDisposable
 
         _logger.Debug("Repaired JSON (added {Brackets} ] and {Braces} }})", brackets, braces);
         return json;
-    }
-
-    private static string SanitizeFilename(string filename)
-    {
-        if (string.IsNullOrWhiteSpace(filename))
-        {
-            return "unnamed_image";
-        }
-
-        // Remove any file extension the model might have added
-        var dotIndex = filename.LastIndexOf('.');
-        if (dotIndex > 0)
-        {
-            filename = filename.Substring(0, dotIndex);
-        }
-
-        // Replace invalid characters
-        var invalidChars = Path.GetInvalidFileNameChars();
-        foreach (var c in invalidChars)
-        {
-            filename = filename.Replace(c, '_');
-        }
-
-        // Replace spaces with underscores
-        filename = filename.Replace(' ', '_');
-
-        // Remove consecutive underscores using regex (more efficient)
-        filename = Regex.Replace(filename, "_+", "_");
-
-        // Trim underscores from start and end
-        filename = filename.Trim('_');
-
-        // Limit length
-        if (filename.Length > Constants.MaxFilenameLength)
-        {
-            filename = filename.Substring(0, Constants.MaxFilenameLength).TrimEnd('_');
-        }
-
-        return string.IsNullOrEmpty(filename) ? "unnamed_image" : filename.ToLowerInvariant();
     }
 
     private static string GetPrompt(string originalFilename)

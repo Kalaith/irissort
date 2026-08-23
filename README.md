@@ -8,23 +8,26 @@ IrisSort is a Windows desktop application that scans folders of images, analyzes
 
 - 🖼️ **AI-Powered Analysis**: Uses vision-capable AI models to understand image contents
 - 📁 **Flexible Processing**: Process single images or entire directories
+- 🗂️ **Recursive Scanning**: Include supported images in subfolders when needed
+- ⏭️ **Skip Existing Tags**: Avoid re-sending files that already have keyword metadata
 - 📝 **Smart Filenames**: Generates descriptive, filesystem-safe names
 - 🏷️ **Automatic Tagging**: Suggests relevant metadata tags
 - ✅ **User Approval**: Preview all changes before applying
 - 🔄 **Batch Operations**: Accept/reject multiple suggestions at once
 - ↩️ **Undo Support**: Revert operations if needed
 - 🔒 **Local Processing**: No cloud uploads required
+- 📴 **Offline-Friendly Review**: Scan and review folders while LM Studio is unavailable
 - 🛡️ **Safe Operations**: Collision detection, dry-run mode, and confirmation dialogs
 
 ## Requirements
 
 - Windows 10 or later
 - .NET 8 SDK
-- [LM Studio](https://lmstudio.ai/) with a vision-capable model loaded
+- [LM Studio](https://lmstudio.ai/) with a vision-capable model loaded (only required for AI analysis)
 
 ## Quick Start
 
-1. **Install LM Studio** and download a vision-capable model (e.g., `zai-org/glm-4.6v-flash`)
+1. **Optional: install LM Studio** and download a vision-capable model (e.g., `zai-org/glm-4.6v-flash`) for AI analysis. IrisSort can still scan and preview files while LM Studio is offline.
 
 2. **Start Local Server** in LM Studio:
    - Load a vision model
@@ -39,6 +42,7 @@ IrisSort is a Windows desktop application that scans folders of images, analyzes
 4. **Choose Processing Mode**:
    - **Single Image**: Select individual files for immediate processing
    - **Directory**: Scan entire folders with batch processing
+   - Enable **Include subfolders** or **Skip tagged** in the action bar for larger libraries
 
 5. **Review AI Suggestions**: Examine proposed filenames and tags
 
@@ -63,13 +67,18 @@ IrisSort/
 - JPEG (.jpg, .jpeg)
 - PNG (.png)
 - WebP (.webp)
+- GIF (.gif, first frame analyzed)
 
 ## Configuration
 
 LM Studio settings in `LmStudioConfiguration.cs`:
 - **BaseUrl**: `http://127.0.0.1:1234/v1` (default)
-- **Model**: `cydonia-22b-v1.3-i1` (configurable)
+- **Model**: `zai-org/glm-4.6v-flash` (configurable)
 - **Timeout**: 120 seconds (vision models need time)
+
+Processing options are saved in `%APPDATA%\IrisSort\config.json`:
+- **Include subfolders**: Recursively scan supported images
+- **Skip tagged**: Skip files with existing keyword metadata
 
 ## Development
 
